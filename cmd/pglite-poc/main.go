@@ -187,7 +187,7 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 	r := newRuntime(ctx)
 	defer r.Close(ctx)
 
-	emcompat.InstantiateWASI(ctx, r, fs)
+	wasiInst, _ := emcompat.InstantiateWASIReturning(ctx, r, fs)
 	compiled, err := emcompat.PrepareAndCompilePrepatched(ctx, r, initdbWasm, fs)
 	if err != nil {
 		return fmt.Errorf("prepare: %w", err)
@@ -202,11 +202,20 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 
 	const popenFile = "/tmp/.popen_output"
 	var lastPgResult int32
-	var pendingPgArgs []string // args for deferred popen('w') execution
+	var pendingPgArgs []string
+	var capturedStdout *[]byte
 
 	cb.OnSystem = func(ctx context.Context, cmd string) int32 {
 		prog, args := emcompat.ParseSystemCommand(cmd)
 		if strings.Contains(prog, "postgres") {
+			// Add -D if not present (postgres needs explicit data dir)
+			hasD := false
+			for _, a := range args {
+				if a == "-D" { hasD = true }
+			}
+			if !hasD {
+				args = append(args, "-D", "/tmp/pglite/data")
+			}
 			fullArgs := append([]string{prog}, args...)
 			fmt.Printf("[system] %s\n", strings.Join(fullArgs, " "))
 			result := runPostgresCmd(ctx, fs, postgresWasm, fullArgs, nil)
@@ -221,6 +230,14 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 		if !strings.Contains(prog, "postgres") {
 			return 0
 		}
+		// Add -D if not present
+		hasD := false
+		for _, a := range args {
+			if a == "-D" { hasD = true }
+		}
+		if !hasD {
+			args = append(args, "-D", "/tmp/pglite/data")
+		}
 		fullArgs := append([]string{prog}, args...)
 		fmt.Printf("[popen %s] %s\n", mode, strings.Join(fullArgs, " "))
 
@@ -230,42 +247,40 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 			fs.WriteFile(popenFile, captured, 0o644)
 			return cb.Fopen(ctx, popenFile, "r")
 		} else if mode == "w" {
-			// Defer postgres execution - initdb will write SQL via stdout
-			// Redirect initdb's stdout to the pipe file using pgl_freopen
+			// Capture stdout to a buffer - initdb writes bootstrap SQL via printf/puts
 			pendingPgArgs = fullArgs
-			freopen := cb.Module.ExportedFunction("pgl_freopen")
-			if freopen != nil {
-				stackAlloc := cb.Module.ExportedFunction("_emscripten_stack_alloc")
-				pathR, _ := stackAlloc.Call(ctx, uint64(len(popenFile)+1))
-				cb.Module.Memory().Write(uint32(pathR[0]), append([]byte(popenFile), 0))
-				modeR, _ := stackAlloc.Call(ctx, 2)
-				cb.Module.Memory().Write(uint32(modeR[0]), []byte("w\x00"))
-				res, _ := freopen.Call(ctx, pathR[0], modeR[0], 1) // 1 = stdout
-				fmt.Printf("[popen w] freopen stdout -> %d\n", int32(res[0]))
-				return int32(res[0]) // Return the FILE* from freopen
-			}
-			return 0
+			var captured []byte
+			capturedStdout = &captured
+			wasiInst.SetStdoutCapture(capturedStdout)
+			// Return stdout FILE* (1 in Emscripten convention? Actually return the
+			// static stdout FILE struct address from initdb globals)
+			// Use global[5] which is the stdout FILE pointer
+			return 29560 // stdout FILE* address (from the disassembly)
 		}
 		return 0
 	}
 
 	cb.OnPclose = func(ctx context.Context, stream int32) int32 {
-		cb.Fclose(ctx, stream)
 		if len(pendingPgArgs) > 0 {
-			// Flush the FILE* before reading - call fflush on initdb module
+			// Flush stdout before reading captured data
 			if fflush := cb.Module.ExportedFunction("fflush"); fflush != nil {
 				fflush.Call(ctx, uint64(stream))
 			}
 
+			// Stop capturing stdout
+			wasiInst.SetStdoutCapture(nil)
+
 			args := pendingPgArgs
 			pendingPgArgs = nil
 
-			// Check how much data was written to the pipe
-			if node, err := fs.Stat(popenFile); err == nil {
-				fmt.Printf("[pclose] pipe has %d bytes of SQL\n", len(node.Data))
+			// Write captured stdout to the pipe file
+			if capturedStdout != nil {
+				fs.WriteFile(popenFile, *capturedStdout, 0o644)
+				fmt.Printf("[pclose] captured %d bytes of SQL\n", len(*capturedStdout))
+				capturedStdout = nil
 			}
+
 			fmt.Printf("[pclose] running: %s\n", strings.Join(args, " "))
-			// Read the written data and provide it as stdin to postgres
 			lastPgResult = runPostgresWithStdin(ctx, fs, postgresWasm, args, popenFile)
 			fmt.Printf("[pclose] -> %d\n", lastPgResult)
 		}

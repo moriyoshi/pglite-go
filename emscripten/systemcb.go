@@ -264,6 +264,7 @@ func ParseSystemCommand(cmd string) (string, []string) {
 		if f == "<" || f == ">" || f == ">>" || f == "|" || f == ";" ||
 			f == "&&" || f == "||" || f == "&" ||
 			strings.HasPrefix(f, "2>") || strings.HasPrefix(f, "1>") ||
+			strings.HasPrefix(f, ">/") || strings.HasPrefix(f, "</") ||
 			f == "2>&1" || f == "1>&2" {
 			break
 		}

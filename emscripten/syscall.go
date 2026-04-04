@@ -141,14 +141,7 @@ func registerAllEnvFunctions(builder wazero.HostModuleBuilder, compiled wazero.C
 			fn = createHostFunc(name, sig)
 		}
 
-		cname := name
-		tracingFn := api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			hostCallCounter++
-			if hostCallCounter%1000000 == 1 {
-				fmt.Printf("[host#%d] %s\n", hostCallCounter, cname)
-			}
-			fn(ctx, mod, stack)
-		})
+		tracingFn := fn
 
 		builder.NewFunctionBuilder().
 			WithGoModuleFunction(tracingFn, sig.params, sig.results).

@@ -362,10 +362,8 @@ func (fs *FS) Close(fd int32) error {
 }
 
 // Read reads from a file descriptor.
+// Note: WASM is single-threaded so we skip locking for read operations.
 func (fs *FS) Read(fd int32, buf []byte) (int, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
 	of, ok := fs.fds[fd]
 	if !ok {
 		return 0, fmt.Errorf("read: bad fd %d", fd)
@@ -385,10 +383,8 @@ func (fs *FS) Read(fd int32, buf []byte) (int, error) {
 }
 
 // Write writes to a file descriptor.
+// Note: WASM is single-threaded so we skip locking for write operations.
 func (fs *FS) Write(fd int32, data []byte) (int, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
 	of, ok := fs.fds[fd]
 	if !ok {
 		return 0, fmt.Errorf("write: bad fd %d", fd)
@@ -400,12 +396,24 @@ func (fs *FS) Write(fd int32, data []byte) (int, error) {
 	node := of.Node
 	offset := of.Offset
 
-	// Extend file if necessary
+	// Extend file if necessary, using capacity-based growing
 	needed := offset + int64(len(data))
 	if needed > int64(len(node.Data)) {
-		newData := make([]byte, needed)
-		copy(newData, node.Data)
-		node.Data = newData
+		if needed > int64(cap(node.Data)) {
+			// Grow with 2x capacity to amortize allocation cost
+			newCap := int64(cap(node.Data)) * 2
+			if newCap < needed {
+				newCap = needed
+			}
+			if newCap < 4096 {
+				newCap = 4096
+			}
+			newData := make([]byte, needed, newCap)
+			copy(newData, node.Data)
+			node.Data = newData
+		} else {
+			node.Data = node.Data[:needed]
+		}
 	}
 	copy(node.Data[offset:], data)
 	of.Offset = offset + int64(len(data))

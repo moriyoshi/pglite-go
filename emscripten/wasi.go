@@ -39,7 +39,28 @@ func InstantiateWASI(ctx context.Context, r wazero.Runtime, fs *vfs.FS) error {
 	return instantiateWASIImpl(ctx, r, fs, nil, nil)
 }
 
+// InstantiateWASIReturning is like InstantiateWASI but returns the WASIInstance for stdout control.
+func InstantiateWASIReturning(ctx context.Context, r wazero.Runtime, fs *vfs.FS) (*WASIInstance, error) {
+	return instantiateWASIFull(ctx, r, fs, nil, nil)
+}
+
+// WASIInstance provides access to the WASI state for runtime stdout override.
+type WASIInstance struct {
+	impl *wasiImpl
+}
+
+// SetStdoutCapture enables capturing stdout to the given buffer.
+// Pass nil to restore normal stdout.
+func (w *WASIInstance) SetStdoutCapture(buf *[]byte) {
+	w.impl.StdoutOverride = buf
+}
+
 func instantiateWASIImpl(ctx context.Context, r wazero.Runtime, fs *vfs.FS, stdinData []byte, stdoutCapture *[]byte) error {
+	_, err := instantiateWASIFull(ctx, r, fs, stdinData, stdoutCapture)
+	return err
+}
+
+func instantiateWASIFull(ctx context.Context, r wazero.Runtime, fs *vfs.FS, stdinData []byte, stdoutCapture *[]byte) (*WASIInstance, error) {
 	builder := r.NewHostModuleBuilder("wasi_snapshot_preview1")
 
 	stdout := io.Writer(os.Stdout)
@@ -101,7 +122,10 @@ func instantiateWASIImpl(ctx context.Context, r wazero.Runtime, fs *vfs.FS, stdi
 		Export("random_get")
 
 	_, err := builder.Instantiate(ctx)
-	return err
+	if err != nil {
+		return nil, err
+	}
+	return &WASIInstance{impl: wasi}, nil
 }
 
 // bufWriter captures writes to a byte slice.
@@ -121,6 +145,8 @@ type wasiImpl struct {
 	envVars   []string
 	stdinData []byte
 	stdinPos  int
+	// StdoutOverride, if non-nil, captures stdout instead of writing to stdout
+	StdoutOverride *[]byte
 }
 
 func defaultEnvVars() []string {
@@ -283,6 +309,16 @@ func (w *wasiImpl) fdRead() api.GoModuleFunc {
 				continue
 			}
 
+			// Special handling for /dev/urandom - return random data
+			of, ok := w.fs.GetFD(fd)
+			if ok && of.Path == "/dev/urandom" {
+				randomBytes := make([]byte, bufLen)
+				rand.Read(randomBytes)
+				mod.Memory().Write(bufPtr, randomBytes)
+				totalRead += bufLen
+				continue
+			}
+
 			readBuf := make([]byte, bufLen)
 			n, err := w.fs.Read(fd, readBuf)
 			if err != nil {
@@ -308,13 +344,7 @@ func (w *wasiImpl) fdRead() api.GoModuleFunc {
 }
 
 func (w *wasiImpl) fdWrite() api.GoModuleFunc {
-	writeCount := 0
 	return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-		writeCount++
-		if writeCount%10000 == 1 {
-			fd := api.DecodeI32(stack[0])
-			fmt.Printf("[fd_write#%d] fd=%d\n", writeCount, fd)
-		}
 		fd := api.DecodeI32(stack[0])
 		iovsPtr := api.DecodeU32(stack[1])
 		iovsLen := api.DecodeU32(stack[2])
@@ -335,7 +365,11 @@ func (w *wasiImpl) fdWrite() api.GoModuleFunc {
 			}
 
 			if fd == 1 {
-				w.stdout.Write(data)
+				if w.StdoutOverride != nil {
+					*w.StdoutOverride = append(*w.StdoutOverride, data...)
+				} else {
+					w.stdout.Write(data)
+				}
 				totalWritten += bufLen
 			} else if fd == 2 {
 				w.stderr.Write(data)
