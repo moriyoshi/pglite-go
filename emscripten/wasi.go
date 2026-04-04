@@ -33,6 +33,11 @@ func InstantiateWASIWithStdin(ctx context.Context, r wazero.Runtime, fs *vfs.FS,
 	return instantiateWASIImpl(ctx, r, fs, stdinData, nil)
 }
 
+// InstantiateWASIWithStdinAndCapture provides stdin data and captures stdout.
+func InstantiateWASIWithStdinAndCapture(ctx context.Context, r wazero.Runtime, fs *vfs.FS, stdinData []byte, stdoutBuf *[]byte) error {
+	return instantiateWASIImpl(ctx, r, fs, stdinData, stdoutBuf)
+}
+
 // InstantiateWASI creates a custom wasi_snapshot_preview1 module that
 // delegates file operations to our VFS instead of the host filesystem.
 func InstantiateWASI(ctx context.Context, r wazero.Runtime, fs *vfs.FS) error {

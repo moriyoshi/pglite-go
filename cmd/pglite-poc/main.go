@@ -360,6 +360,31 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 	return nil
 }
 
+// runPostgresWithSQL runs postgres in single-user mode with SQL as stdin
+func runPostgresWithSQL(ctx context.Context, fs *vfs.FS, postgresWasm []byte, args []string, sql string, stdoutBuf *[]byte) int32 {
+	r := newRuntime(ctx)
+	defer r.Close(ctx)
+
+	emcompat.InstantiateWASIWithStdinAndCapture(ctx, r, fs, []byte(sql), stdoutBuf)
+
+	compiled, err := emcompat.PrepareAndCompilePrepatched(ctx, r, postgresWasm, fs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[pg-sql] prepare: %v\n", err)
+		return -1
+	}
+
+	mod, err := r.InstantiateModule(ctx, compiled,
+		wazero.NewModuleConfig().WithName("postgres").
+			WithStdout(os.Stdout).WithStderr(os.Stderr))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[pg-sql] instantiate: %v\n", err)
+		return -1
+	}
+	defer mod.Close(ctx)
+
+	return callMain(ctx, mod, args)
+}
+
 func runPostgres(ctx context.Context, fs *vfs.FS, postgresWasm []byte) error {
 	r := newRuntime(ctx)
 	defer r.Close(ctx)
@@ -382,11 +407,19 @@ func runPostgres(ctx context.Context, fs *vfs.FS, postgresWasm []byte) error {
 		relocs.Call(ctx)
 	}
 
+	// Run postgres in single-user mode with a test SQL query as stdin
+	sql := "SELECT 1 + 1 AS result;\n"
+	fmt.Printf("Executing SQL: %s", sql)
+
 	args := []string{"/pglite/bin/postgres", "--single", "-D", "/tmp/pglite/data", "template1"}
 	fmt.Printf("Running: %s\n", strings.Join(args, " "))
-	result := callMain(ctx, mod, args)
-	if result != 0 {
-		return fmt.Errorf("postgres exited with %d", result)
+
+	// Provide SQL via stdin
+	var stdoutBuf []byte
+	result := runPostgresWithSQL(ctx, fs, postgresWasm, args, sql, &stdoutBuf)
+	fmt.Printf("postgres returned: %d\n", result)
+	if len(stdoutBuf) > 0 {
+		fmt.Printf("Output:\n%s\n", string(stdoutBuf))
 	}
 	return nil
 }
