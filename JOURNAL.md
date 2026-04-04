@@ -145,13 +145,15 @@ Since fopen-created FILE structs had broken write function pointers (the exact c
 
 2. **Wire protocol bridge**: To execute SQL queries, need to implement PGlite's `pgl_set_rw_cbs` mechanism which provides read/write callbacks for the PostgreSQL wire protocol (same protocol as libpq).
 
-3. **Shared memory (`mmap`)**: The `__syscall_mmap_js` stub returns failure, causing `FATAL: could not map anonymous shared memory: Out of memory` for `--check` commands. PGlite handles this in its C glue layer (`pglitec.c`).
+3. **Shared memory (`mmap`)**: Implemented via `emscripten_builtin_memalign`. Anonymous mmap allocates aligned memory in the WASM linear memory. PostgreSQL's shared memory subsystem now works.
 
-4. **fopen FILE struct issue**: Dynamically-created FILE structs from `fopen` have correct function pointer values (verified by memory dump) but writes still don't reach WASI `fd_write`. The exact cause is unclear - the write function pointer (table index 10) matches the correct `__stdio_write` function with the correct type signature. The workaround (stdout capture via `pgl_freopen`) works but is not a general solution.
+4. **fopen FILE struct issue**: Dynamically-created FILE structs from `fopen` have correct function pointer values (verified by memory dump) but writes cause an infinite loop (74M+ fd_write calls). The root cause is unclear - the workaround uses `pgl_freopen` + WASI stdout capture instead of `fopen` for pipe files.
 
-5. **Compilation cache**: Pre-compiling `pglite.wasm` (8.7MB) takes ~90 seconds. wazero's `CompilationCache` helps with subsequent runs but the first compilation is slow. Consider persisting the cache to disk.
+5. **Emscripten environment variables**: Emscripten doesn't use WASI `environ_get`. It has its own env mechanism via `Module.ENV` in JavaScript. Our WASI environ functions are never called. Workaround: pass `-D /tmp/pglite/data` explicitly to all postgres subcommands.
 
-6. **Performance**: Each postgres subcommand creates a new wazero runtime. Sharing compiled modules via `CompilationCache` helps but instantiation overhead remains. PGlite's JS version reuses a single module instance with heap restoration (`HEAPU8.set(origHEAPU8)`).
+6. **Compilation cache**: `wazero.CompilationCache` shares compiled code across runtimes. First compilation takes ~90 seconds, subsequent instantiations are fast (~1-2s each).
+
+7. **Performance**: Each postgres subcommand creates a new wazero runtime. `CompilationCache` helps but instantiation overhead remains. PGlite's JS version reuses a single module instance with heap restoration.
 
 ## Timeline
 
@@ -164,7 +166,7 @@ Since fopen-created FILE structs had broken write function pointers (the exact c
 | PostgreSQL boot (config parsing) | Done |
 | initdb directory/config creation | Done |
 | initdb bootstrap (postgres --boot) | Done |
-| PostgreSQL single-user mode start | Done |
-| Post-bootstrap template1 setup | Partial (exit code 1) |
+| initdb post-bootstrap (postgres --single) | Done (exit 1 on collation import) |
+| PostgreSQL single-user mode start | Done (checkpoint works, 8 buffers) |
 | Wire protocol for SQL queries | Not started |
 | `database/sql` driver interface | Not started |
