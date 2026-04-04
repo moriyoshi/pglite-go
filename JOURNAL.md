@@ -39,7 +39,7 @@ wazero's `HostModuleBuilder` only supports function exports. To provide globals,
 
 initdb calls `system()` and `popen()` to run postgres subcommands. PGlite uses `pgl_set_system_fn`, `pgl_set_popen_fn`, `pgl_set_pclose_fn` to register function-pointer callbacks. Since wazero doesn't allow modifying the function table post-instantiation, we create a small WASM bridge module that:
 
-1. Imports Go handler functions from a `initdb_host` module
+1. Imports Go handler functions from an `initdb_host` module
 2. Imports the shared table from `env.extras`
 3. Defines wrapper functions and places them in the table via element segments
 
@@ -92,7 +92,7 @@ Our initial implementation returned all directory entries on every call. The cal
 
 The start function calls `__wasm_call_ctors` which runs data relocations AND C++ static constructors. For `pglite.wasm`, the C++ constructor for `std::__stdinbuf` crashes with `call_indirect` type mismatch (libc++ iostream vtable issue). For `initdb.wasm`, it succeeds.
 
-For pglite.wasm, we skip the start function (`WithStartFunctions()`) and manually call `__wasm_apply_data_relocs`. This is sufficient because PostgreSQL doesn't use C++ iostream.
+For pglite.wasm, we let the start function run (it initializes `environ` and other C runtime state) despite the libc++ constructor crash. The crash is handled by the invoke/setjmp mechanism and doesn't prevent PostgreSQL from functioning since it doesn't use C++ iostream.
 
 ### 6. Shell command parsing must stop at operators
 
@@ -104,7 +104,7 @@ PGlite's `getArgs()` uses a shell parser that recognizes `<`, `>`, `|`, etc. as 
 
 **Impact**: 74 million fd_write calls for 953KB of bootstrap SQL took 600+ seconds.
 
-musl's stdio flushes the FILE buffer via WASI `fd_write`. Each call crossed the WASM→Go boundary and our VFS `Write` method allocated a new byte slice for every extension (`make + copy` = O(n^2)).
+musl's stdio flushes the FILE buffer via WASI `fd_write`. Each call crossed the WASM→Go boundary and our VFS `Write` method allocated a new byte slice for every extension (`make + copy` = O(n²)).
 
 Fixes:
 - Capacity-based growing (2x amortized allocation)
@@ -125,7 +125,29 @@ PGlite's initdb uses `popen("w")` to pipe bootstrap SQL to `postgres --boot`. Th
 2. initdb writes ~953KB of bootstrap SQL via fprintf/puts
 3. On pclose(), postgres --boot runs with the SQL as stdin
 
-Since fopen-created FILE structs had broken write function pointers (the exact cause is still unclear - possibly related to musl's `__stdio_write` function index), we use WASI stdout capture: popen("w") starts capturing stdout, initdb writes SQL via its existing stdout FILE struct (which works), and pclose() saves the captured data and feeds it to postgres as stdin.
+Since fopen-created FILE structs cause an infinite write loop (74M+ fd_write calls despite correct function pointers - root cause still unclear), we use WASI stdout capture: popen("w") starts capturing stdout, initdb writes SQL via its existing stdout FILE struct (which works correctly), and pclose() saves the captured data and feeds it to postgres as stdin.
+
+### 10. Anonymous mmap for shared memory
+
+**Impact**: `FATAL: could not map anonymous shared memory: Out of memory` on every `postgres --check` and `postgres --boot` call.
+
+PostgreSQL uses `mmap(MAP_ANONYMOUS | MAP_SHARED)` for shared memory segments. Implemented `_mmap_js` by calling the WASM module's exported `emscripten_builtin_memalign(65536, len)` to allocate page-aligned memory within the WASM linear memory space. Also implemented `emscripten_resize_heap` to allow WASM memory growth.
+
+### 11. Emscripten environment variables bypass WASI
+
+**Impact**: `postgres --boot` couldn't find PGDATA despite our WASI `environ_get` returning it.
+
+Emscripten does NOT use WASI `environ_get`/`environ_sizes_get` for environment variables. It has its own mechanism: the JavaScript runtime sets `Module.ENV` and calls C `setenv()` during `preRun`. Our WASI environ functions are never called.
+
+Workaround: pass `-D /tmp/pglite/data` explicitly to all postgres subcommands instead of relying on the `PGDATA` environment variable.
+
+### 12. `-D` data directory placement matters
+
+**Impact**: `--boot requires a value` or `invalid command-line argument: -D`.
+
+PostgreSQL 17's `getopt_long` parsing is sensitive to option ordering. `-D /tmp/pglite/data --boot` causes `--boot` to be misinterpreted as requiring a value. For `--single` mode, `-D` must come before the database name (last positional argument).
+
+Solution: append `-D` after `--boot` flags (no database name follows); insert `-D` before the database name for `--single`; skip for `-V`/`--version`.
 
 ## Current Status
 
@@ -133,27 +155,30 @@ Since fopen-created FILE structs had broken write function pointers (the exact c
 
 - **initdb**: Creates full database cluster (directories, configs, system catalogs)
 - **postgres --boot**: Processes 953KB of bootstrap SQL, creates `global/pg_control`
-- **postgres --single**: Starts with `backend>` prompt, performs WAL checkpoints
-- **VFS**: 694 files from PGlite npm package + runtime-created files
+- **postgres --single**: Starts with `backend>` prompt, performs WAL checkpoints, executes SQL
+- **SQL queries**: `SELECT 1 + 1 AS result` returns `typeid=23 (int4), result column` via single-user stdin/stdout
+- **VFS**: 694 files from PGlite npm package + runtime-created database files
 - **30+ syscalls**: openat, stat64, lstat64, faccessat, mkdirat, readlinkat, getdents64, pipe, getcwd, chdir, fchmod, fchown, unlinkat, renameat, fcntl64, ioctl, dup, ftruncate64, fdatasync, utimensat, statfs64, fadvise64, fallocate, symlinkat
-- **Custom WASI**: fd_read/write/seek/close/sync/pread/pwrite, environ, clock_time_get, random_get, proc_exit
-- **Emscripten runtime**: invoke_*, longjmp, date_now, get_now, resize_heap, localtime_js, gmtime_js, mktime_js, tzset_js, setitimer_js
+- **Custom WASI**: fd_read/write/seek/close/sync/pread/pwrite, environ, clock_time_get, random_get, proc_exit, stdin/stdout capture
+- **Emscripten runtime**: invoke_*, longjmp, date_now, get_now, resize_heap, mmap_js, munmap_js, localtime_js, gmtime_js, mktime_js, tzset_js, setitimer_js
 
 ### What Remains
 
-1. **Post-bootstrap initialization**: `postgres --single` for template1 setup returns exit code 1 (some init SQL fails). Likely related to missing `mmap` support for shared memory or missing socket syscalls.
+1. **Post-bootstrap template1 initialization**: `postgres --single` for template1 setup returns exit code 1. The `pg_import_system_collations` function fails, likely because locale/collation data from the host OS is unavailable in the WASM environment. PGlite's JS version may handle this differently via its Emscripten FS layer. This doesn't prevent basic SQL execution but means some system catalog entries are incomplete.
 
-2. **Wire protocol bridge**: To execute SQL queries, need to implement PGlite's `pgl_set_rw_cbs` mechanism which provides read/write callbacks for the PostgreSQL wire protocol (same protocol as libpq).
+2. **Wire protocol bridge**: Currently queries use single-user mode stdin/stdout (text format). For production use, implement PGlite's `pgl_set_rw_cbs` mechanism which provides read/write callbacks for the PostgreSQL wire protocol (same binary protocol as libpq). This would enable proper result parsing, prepared statements, and transactions.
 
-3. **Shared memory (`mmap`)**: Implemented via `emscripten_builtin_memalign`. Anonymous mmap allocates aligned memory in the WASM linear memory. PostgreSQL's shared memory subsystem now works.
+3. **`database/sql` driver interface**: Wrap the wire protocol in a Go `database/sql` driver to provide the standard Go database API (`db.Query()`, `db.Exec()`, etc.).
 
-4. **fopen FILE struct issue**: Dynamically-created FILE structs from `fopen` have correct function pointer values (verified by memory dump) but writes cause an infinite loop (74M+ fd_write calls). The root cause is unclear - the workaround uses `pgl_freopen` + WASI stdout capture instead of `fopen` for pipe files.
+4. **fopen FILE struct write loop**: Dynamically-created FILE structs from `fopen` have correct function pointer values (verified by memory dump: write=10 → table[10] with matching type signature) but writes cause an infinite loop. The workaround (stdout capture) works for the initdb pipe but is not a general solution. Root cause investigation needed — possibly related to FILE buffer initialization or musl internal state.
 
-5. **Emscripten environment variables**: Emscripten doesn't use WASI `environ_get`. It has its own env mechanism via `Module.ENV` in JavaScript. Our WASI environ functions are never called. Workaround: pass `-D /tmp/pglite/data` explicitly to all postgres subcommands.
+5. **Emscripten environment variables**: Need to implement `setenv` calls on the WASM module to properly set environment variables (PGDATA, PATH, etc.) instead of passing `-D` flags explicitly. This requires either finding/exporting `setenv` from the WASM module or writing to the `environ` array in WASM memory directly.
 
-6. **Compilation cache**: `wazero.CompilationCache` shares compiled code across runtimes. First compilation takes ~90 seconds, subsequent instantiations are fast (~1-2s each).
+6. **Compilation cache persistence**: First compilation of `pglite.wasm` (8.7MB) takes ~90 seconds (AOT compilation to native code). `wazero.CompilationCache` helps with subsequent instantiations within the same process, but the cache is lost on restart. Consider using file-based cache persistence.
 
-7. **Performance**: Each postgres subcommand creates a new wazero runtime. `CompilationCache` helps but instantiation overhead remains. PGlite's JS version reuses a single module instance with heap restoration.
+7. **Single-instance reuse**: Each postgres subcommand currently creates a new wazero runtime (compile → instantiate → run → close). PGlite's JS version reuses a single WASM instance with heap restoration (`HEAPU8.set(origHEAPU8)`) for dramatically faster repeated calls. Implementing this pattern in wazero would require snapshotting/restoring WASM linear memory.
+
+8. **VFS persistence**: The in-memory VFS loses all data when the process exits. For a production embeddable database, need to persist the VFS to disk (or implement a VFS layer backed by the host filesystem).
 
 ## Timeline
 
@@ -163,11 +188,15 @@ Since fopen-created FILE structs had broken write function pointers (the exact c
 | Emscripten host function layer | Done |
 | In-memory VFS + preloaded data | Done |
 | Custom WASI implementation | Done |
-| PostgreSQL boot (config parsing) | Done |
+| WASM binary patching | Done |
+| initdb callback bridge (system/popen/pclose) | Done |
+| PostgreSQL boot (config parsing, timezone) | Done |
 | initdb directory/config creation | Done |
-| initdb bootstrap (postgres --boot) | Done |
-| initdb post-bootstrap (postgres --single) | Done (exit 1 on collation import) |
-| PostgreSQL single-user mode start | Done (checkpoint works, 8 buffers) |
-| SQL query execution | Done (`SELECT 1+1` returns result via single-user mode) |
-| Wire protocol for SQL queries | Not started (currently uses single-user stdin/stdout) |
+| initdb bootstrap (postgres --boot, 953KB SQL) | Done |
+| initdb post-bootstrap (postgres --single, 249KB SQL) | Done (exit 1 on collation import) |
+| Anonymous mmap for shared memory | Done |
+| PostgreSQL single-user mode start | Done (checkpoint works, 8 buffers, 7 sync files) |
+| SQL query execution (single-user mode) | Done (`SELECT 1+1` → result) |
+| Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
+| VFS persistence | Not started |
