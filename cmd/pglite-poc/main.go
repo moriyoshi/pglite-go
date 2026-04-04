@@ -76,6 +76,43 @@ func main() {
 }
 
 // runPostgresCmd runs a postgres subcommand. If stdoutCapture is non-nil, stdout is captured.
+// insertDataDir adds -D /tmp/pglite/data to postgres args.
+// For --boot and --single, -D must come before the flag.
+// For --check, we skip (returning 0 from OnSystem instead).
+// For -V, -D is not needed.
+func insertDataDir(args []string) []string {
+	for _, a := range args {
+		if a == "-D" {
+			return args
+		}
+	}
+	// Don't add -D for version check
+	for _, a := range args {
+		if a == "-V" || a == "--version" {
+			return args
+		}
+	}
+	// Use -D at the end. For --single mode, insert before the database name.
+	// For --boot, append at end (no database name follows).
+	for i, a := range args {
+		if a == "--single" {
+			// Find the database name (last non-flag arg)
+			// Insert -D before the database name
+			for j := len(args) - 1; j > i; j-- {
+				if !strings.HasPrefix(args[j], "-") {
+					result := make([]string, 0, len(args)+2)
+					result = append(result, args[:j]...)
+					result = append(result, "-D", "/tmp/pglite/data")
+					result = append(result, args[j:]...)
+					return result
+				}
+			}
+		}
+	}
+	// For other modes (--boot), just append
+	return append(args, "-D", "/tmp/pglite/data")
+}
+
 func runPostgresCmd(ctx context.Context, fs *vfs.FS, postgresWasm []byte, args []string, stdoutCapture *[]byte) int32 {
 	r := newRuntime(ctx)
 	defer r.Close(ctx)
@@ -93,7 +130,7 @@ func runPostgresCmd(ctx context.Context, fs *vfs.FS, postgresWasm []byte, args [
 	}
 
 	mod, err := r.InstantiateModule(ctx, compiled,
-		wazero.NewModuleConfig().WithName("postgres").WithStartFunctions().
+		wazero.NewModuleConfig().WithName("postgres").
 			WithStdout(os.Stdout).WithStderr(os.Stderr))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[pg] instantiate: %v\n", err)
@@ -168,7 +205,7 @@ func runPostgresWithStdin(ctx context.Context, fs *vfs.FS, postgresWasm []byte, 
 	}
 
 	mod, err := r.InstantiateModule(ctx, compiled,
-		wazero.NewModuleConfig().WithName("postgres").WithStartFunctions().
+		wazero.NewModuleConfig().WithName("postgres").
 			WithStdout(os.Stdout).WithStderr(os.Stderr))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[pg-stdin] instantiate: %v\n", err)
@@ -208,14 +245,14 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 	cb.OnSystem = func(ctx context.Context, cmd string) int32 {
 		prog, args := emcompat.ParseSystemCommand(cmd)
 		if strings.Contains(prog, "postgres") {
-			// Add -D if not present (postgres needs explicit data dir)
-			hasD := false
+			// For --check commands, return 0 (success) to skip probing
+			// This accepts the first proposed value for max_connections/shared_buffers
 			for _, a := range args {
-				if a == "-D" { hasD = true }
+				if a == "--check" {
+					return 0
+				}
 			}
-			if !hasD {
-				args = append(args, "-D", "/tmp/pglite/data")
-			}
+			args = insertDataDir(args)
 			fullArgs := append([]string{prog}, args...)
 			fmt.Printf("[system] %s\n", strings.Join(fullArgs, " "))
 			result := runPostgresCmd(ctx, fs, postgresWasm, fullArgs, nil)
@@ -226,18 +263,12 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 	}
 
 	cb.OnPopen = func(ctx context.Context, cmd string, mode string) int32 {
+		fmt.Printf("[popen raw] %q\n", cmd)
 		prog, args := emcompat.ParseSystemCommand(cmd)
 		if !strings.Contains(prog, "postgres") {
 			return 0
 		}
-		// Add -D if not present
-		hasD := false
-		for _, a := range args {
-			if a == "-D" { hasD = true }
-		}
-		if !hasD {
-			args = append(args, "-D", "/tmp/pglite/data")
-		}
+		args = insertDataDir(args)
 		fullArgs := append([]string{prog}, args...)
 		fmt.Printf("[popen %s] %s\n", mode, strings.Join(fullArgs, " "))
 
@@ -340,7 +371,7 @@ func runPostgres(ctx context.Context, fs *vfs.FS, postgresWasm []byte) error {
 	}
 
 	mod, err := r.InstantiateModule(ctx, compiled,
-		wazero.NewModuleConfig().WithName("pglite").WithStartFunctions().
+		wazero.NewModuleConfig().WithName("pglite").
 			WithStdout(os.Stdout).WithStderr(os.Stderr))
 	if err != nil {
 		return fmt.Errorf("instantiate: %w", err)

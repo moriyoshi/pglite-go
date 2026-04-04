@@ -237,8 +237,18 @@ func createHostFunc(name string, sig funcSig) api.GoModuleFunc {
 		})
 	case "emscripten_resize_heap":
 		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
-			fmt.Printf("[emscripten] resize_heap requested\n")
-			stack[0] = 0
+			requestedSize := api.DecodeU32(stack[0])
+			mem := mod.Memory()
+			currentPages := mem.Size() / 65536
+			neededPages := (requestedSize + 65535) / 65536
+			if neededPages > currentPages {
+				grew, ok := mem.Grow(neededPages - currentPages)
+				if !ok || grew == 0 {
+					stack[0] = 0 // failure
+					return
+				}
+			}
+			stack[0] = 1 // success
 		})
 	case "_abort_js":
 		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
@@ -304,6 +314,58 @@ func createHostFunc(name string, sig funcSig) api.GoModuleFunc {
 			mem.WriteUint32Le(daylightPtr, 0)
 			mem.Write(stdNamePtr, []byte("UTC\x00"))
 			mem.Write(dstNamePtr, []byte("UTC\x00"))
+		})
+	case "_mmap_js":
+		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
+			length := api.DecodeU32(stack[0])
+			// prot := api.DecodeI32(stack[1])
+			// flags := api.DecodeI32(stack[2])
+			// fd := api.DecodeI32(stack[3])
+			// offset := int64(stack[4])
+			allocatedPtr := api.DecodeU32(stack[5])
+			addrPtr := api.DecodeU32(stack[6])
+
+			// Allocate aligned memory via the module's memalign
+			memalign := mod.ExportedFunction("emscripten_builtin_memalign")
+			if memalign == nil {
+				memalign = mod.ExportedFunction("malloc")
+			}
+			if memalign == nil {
+				stack[0] = api.EncodeI32(-ENOSYS)
+				return
+			}
+
+			var ptr uint32
+			if memalign.Definition().Name() == "emscripten_builtin_memalign" {
+				results, err := memalign.Call(ctx, 65536, uint64(length))
+				if err != nil || results[0] == 0 {
+					stack[0] = api.EncodeI32(-ENOSYS)
+					return
+				}
+				ptr = uint32(results[0])
+			} else {
+				results, err := memalign.Call(ctx, uint64(length))
+				if err != nil || results[0] == 0 {
+					stack[0] = api.EncodeI32(-ENOSYS)
+					return
+				}
+				ptr = uint32(results[0])
+			}
+
+			// Zero the allocated memory
+			zeros := make([]byte, length)
+			mod.Memory().Write(ptr, zeros)
+
+			// Write output parameters
+			mod.Memory().WriteUint32Le(allocatedPtr, 1) // allocated = true
+			mod.Memory().WriteUint32Le(addrPtr, ptr)
+
+			stack[0] = 0 // success
+		})
+	case "_munmap_js":
+		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
+			// No-op for now - memory is freed when the module is closed
+			stack[0] = 0
 		})
 	case "_setitimer_js":
 		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {

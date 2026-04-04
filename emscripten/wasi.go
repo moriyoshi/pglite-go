@@ -191,6 +191,7 @@ func (w *wasiImpl) environGet() api.GoModuleFunc {
 		if len(vars) == 0 {
 			vars = defaultEnvVars()
 		}
+		fmt.Printf("[environ_get] writing %d vars\n", len(vars))
 		bufOffset := environBufPtr
 		for i, v := range vars {
 			// Write pointer to the env string
