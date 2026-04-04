@@ -168,5 +168,6 @@ Since fopen-created FILE structs had broken write function pointers (the exact c
 | initdb bootstrap (postgres --boot) | Done |
 | initdb post-bootstrap (postgres --single) | Done (exit 1 on collation import) |
 | PostgreSQL single-user mode start | Done (checkpoint works, 8 buffers) |
-| Wire protocol for SQL queries | Not started |
+| SQL query execution | Done (`SELECT 1+1` returns result via single-user mode) |
+| Wire protocol for SQL queries | Not started (currently uses single-user stdin/stdout) |
 | `database/sql` driver interface | Not started |
