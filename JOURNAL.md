@@ -254,17 +254,32 @@ Key findings:
   (`__heap_base`), `wasi_snapshot_preview1`:13 funcs. Of the env funcs, ~87 are
   `__syscall_*`, ~60 are `invoke_*` trampolines, the rest Emscripten runtime.
 
-**Execution port status (in progress):** The full port to actually run postgres on
-wasmtime is scoped and de-risked but incomplete (multi-session). Plan:
-1. Adapter implementing wazero's `api.Module`/`api.Memory` over wasmtime memory +
-   `Caller`, so the existing syscall/WASI Go closures are reused unchanged (they only
-   touch `mod.Memory()` (63×) and `mod.ExportedFunction()` (2×, the mmap path)).
-2. Re-implement `invoke_*`/`_emscripten_throw_longjmp`: on an indirect table call,
-   save stack (`emscripten_stack_get_current`), call `table[index]`, and on a longjmp
-   trap restore the stack + `setThrew(1,0)`. wasmtime resumes exports after a trap,
-   so this is viable (mirrors wazero's internal emscripten package).
-3. Port the initdb system/popen/pclose bridge (place wrapper funcs in the table).
-4. Wire `_mmap_js` into wasmtime linear memory + `emscripten_resize_heap`.
+**Execution port status:** PostgreSQL **runs on wasmtime** — `postgres -V` prints
+"PostgreSQL 17.5" and exits 0 (see `emscripten/wasmtime_port.go`,
+`cmd/pglite-wasmtime`, behind `//go:build wasmtime`; run
+`go run -tags wasmtime ./cmd/pglite-wasmtime`). This exercises compile+instantiate
+(1.5s), data relocs, C++ static ctors via the invoke_/longjmp trampolines (the
+libc++ iostream crash the journal documents — handled correctly), argv setup, and
+WASI stdout. What worked:
+1. **Reuse via adapters.** wazero *seals* `api.Module`/`api.Memory`/`api.Function`
+   with an unexported `wazeroOnly()` marker, so external types can't implement them.
+   Workaround: embed the interface (nil) to inherit the marker, then override the
+   ~6 methods actually used. This lets the wasmtime path reuse the *exact* wazero Go
+   closures (syscalls, WASI, Emscripten runtime funcs) unchanged.
+2. **invoke_/longjmp via trap-and-resume.** `_emscripten_throw_longjmp` returns a
+   sentinel-messaged `wasmtime.Trap`; the invoke trampoline saves the stack
+   (`emscripten_stack_get_current`), calls `table[index]`, and on that trap restores
+   the stack + `setThrew(1,0)`. wasmtime resumes exports after a trap, so this works.
+3. **No binary patching / no env.extras.** Globals, memory, and table are native
+   wasmtime externs.
+
+Remaining for full end-to-end (initdb + `SELECT 1+1`) on wasmtime — task #4:
+- Port the initdb system/popen/pclose bridge. On wasmtime this is *simpler*: place
+  the callback funcs directly with `table.Set(store, idx, funcref)` instead of
+  wazero's synthesized element-segment bridge module.
+- An instance-backed (not `Caller`-backed) module adapter for the Go-side
+  orchestration callbacks, nested `WTRuntime` per subcommand, `_mmap_js` during
+  `--boot`, and stdout-capture toggling. Then benchmark end-to-end vs wazero.
 
 ## Timeline
 
@@ -287,7 +302,8 @@ wasmtime is scoped and de-risked but incomplete (multi-session). Plan:
 | VFS persistence + skip-initdb on restart | Done (2.3s restart vs 8.6s first run) |
 | wasmtime compile + instantiate benchmark | Done (1.43s compile, 0.002s instantiate) |
 | wasmedge AOT compile benchmark | Done (218s LLVM-O2, 20.6MB .so) |
-| wasmtime full execution port | In progress (scoped, not yet running postgres) |
+| wasmtime execution port: postgres -V runs | Done (1.5s compile+instantiate+run) |
+| wasmtime full initdb + SELECT | In progress (initdb bridge remaining) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |
