@@ -174,7 +174,7 @@ Solution: append `-D` after `--boot` flags (no database name follows); insert `-
 
 5. **Emscripten environment variables**: Need to implement `setenv` calls on the WASM module to properly set environment variables (PGDATA, PATH, etc.) instead of passing `-D` flags explicitly. This requires either finding/exporting `setenv` from the WASM module or writing to the `environ` array in WASM memory directly.
 
-6. **Compilation cache persistence**: First compilation of `pglite.wasm` (8.7MB) takes ~90 seconds (AOT compilation to native code). `wazero.CompilationCache` helps with subsequent instantiations within the same process, but the cache is lost on restart. Consider using file-based cache persistence.
+6. **Compilation cache persistence**: ~~First compilation of `pglite.wasm` (8.7MB) takes ~90 seconds...~~ **DONE.** Switched the PoC from `wazero.NewCompilationCache()` (in-memory only, lost on restart) to `wazero.NewCompilationCacheWithDir()` in `~/Library/Caches/pglite-go/wazero` (via `os.UserCacheDir()`, repo-local `.wazero-cache` fallback). Measured: cold compile 100–138s → **warm start 0.58s (~170× faster)**. On-disk cache ~34MB. The cache is keyed on the patched wasm bytes + wazero version, so it self-invalidates on a wasm swap or wazero upgrade. Remaining startup cost is now dominated by initdb/bootstrap work, not compilation.
 
 7. **Single-instance reuse**: Each postgres subcommand currently creates a new wazero runtime (compile → instantiate → run → close). PGlite's JS version reuses a single WASM instance with heap restoration (`HEAPU8.set(origHEAPU8)`) for dramatically faster repeated calls. Implementing this pattern in wazero would require snapshotting/restoring WASM linear memory.
 
@@ -197,6 +197,7 @@ Solution: append `-D` after `--boot` flags (no database name follows); insert `-
 | Anonymous mmap for shared memory | Done |
 | PostgreSQL single-user mode start | Done (checkpoint works, 8 buffers, 7 sync files) |
 | SQL query execution (single-user mode) | Done (`SELECT 1+1` → result) |
+| Persistent (file-backed) compilation cache | Done (0.58s warm vs ~138s cold) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |

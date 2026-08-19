@@ -16,6 +16,16 @@ import (
 // Global compilation cache shared across all runtimes
 var compilationCache wazero.CompilationCache
 
+// wasmCacheDir returns a stable, per-user directory for wazero's persistent
+// compilation cache. Falls back to a repo-local dir if the OS cache dir is
+// unavailable.
+func wasmCacheDir() string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return dir + "/pglite-go/wazero"
+	}
+	return ".wazero-cache"
+}
+
 func newRuntime(ctx context.Context) wazero.Runtime {
 	config := wazero.NewRuntimeConfig().WithCompilationCache(compilationCache)
 	return wazero.NewRuntimeWithConfig(ctx, config)
@@ -27,7 +37,16 @@ func main() {
 		wasmDir = os.Args[1]
 	}
 
-	compilationCache = wazero.NewCompilationCache()
+	// Persist the AOT-compiled native code to disk so the ~90s compile of
+	// pglite.wasm (8.7MB) is paid only once, not on every process restart.
+	// Cache contents are wazero-version-specific; the dir is created if absent.
+	cacheDir := wasmCacheDir()
+	if c, err := wazero.NewCompilationCacheWithDir(cacheDir); err == nil {
+		compilationCache = c
+	} else {
+		fmt.Fprintf(os.Stderr, "warning: file cache at %s unavailable (%v); using in-memory cache\n", cacheDir, err)
+		compilationCache = wazero.NewCompilationCache()
+	}
 	defer compilationCache.Close(context.Background())
 
 	fs := vfs.New()
