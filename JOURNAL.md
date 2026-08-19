@@ -52,6 +52,58 @@ port onto a second WASM runtime. Full detail in the sections below; the highligh
 `emscripten/wasmtime_port.go` (adapters + invoke/longjmp), `vfs/persist.go` +
 `vfs/persist_test.go` (data-dir persistence).
 
+## Findings: why wazero is slow (CPU-profiled, 2026-08-19)
+
+Profiled both axes with Go pprof (`cmd/prof-compile`, `cmd/prof-exec`). Two
+distinct bottlenecks, both structural — not incidental.
+
+### Compile bottleneck: imported-global access explosion (~66% of compile)
+
+`wazevo` (wazero's SSA optimizing compiler) spends its time here:
+
+| Function | cum % | what it is |
+|----------|-------|------------|
+| `frontend.getWasmGlobalValue` | **39%** | one SSA load + a per-BB **map assign** per global access |
+| `ssa.passDeadCodeEliminationOpt` | 18% | cleaning up the resulting instruction bloat |
+| `ssa.passNopInstElimination` | 9% | ditto |
+
+Root cause: **PGlite is an Emscripten MAIN_MODULE (dynamically linked)**, so the C
+stack pointer is an *imported mutable global* `__stack_pointer`, touched in every
+prologue/epilogue/alloca. wazevo lowers each `global.get`/`global.set` to a memory
+load/store plus `DefineVariableInCurrentBB` (a Go **map** write, `mapassign_fast32`
+alone = 17%). Pervasive stack-pointer traffic → a flood of SSA loads → the DCE/nop
+passes then have to delete them all. Cranelift (wasmtime) handles imported globals
+without this per-access map overhead, hence ~70× faster compile.
+Mitigations: file compile cache (done, amortizes it); a *statically*-linked PGlite
+build would sidestep it; worth an upstream wazero issue.
+(Note: clean-machine compile was ~28s here; the earlier ~100–138s figures were under
+heavy concurrent load — wall time is very sensitive to background CPU pressure.)
+
+### Execution bottleneck: full linear-memory copy on every heap grow (~65–73%)
+
+On a compute-heavy query, 65–73% of CPU is `MemoryInstance.Grow` →
+`runtime.growslice` → `runtime.memmove`. wazero's default memory is a Go `[]byte`;
+`Grow` does `append(buffer, make(...))`, i.e. **reallocate + copy the entire linear
+memory** whenever `newPages > Cap`. PostgreSQL grows its heap incrementally
+(mmap/`sbrk` for shared buffers, sorts, temp tables), so the multi-hundred-MB buffer
+is copied over and over. wasmtime reserves the max via mmap and commits pages, so it
+never copies.
+
+**Validated fix:** `RuntimeConfig.WithMemoryCapacityFromMax(true)` sets `Cap = Max`
+up front, so `Grow` takes the "already have capacity" branch and just reslices — no
+copy. Measured on the heavy workload: execution **0.41s → 0.30s (~27% faster)** and
+`MemoryInstance.Grow`/`memmove`-from-grow vanish from the profile (CPU samples
+260ms → 130ms). Caveat: it eagerly allocates the declared max (here 2GB) — so also
+lower `env.extras`'s declared memory max (e.g. to 8192–16384 pages = 512MB–1GB) to
+bound the one-time allocation, or plug in an mmap-based `experimental.MemoryAllocator`.
+Not yet wired into `cmd/pglite-poc` (needs the bounded-max change + revalidation).
+
+### Net
+wazero is slow for two independent, structural reasons tied to how this particular
+module is built (dynamic linking → imported `__stack_pointer`) and how wazero manages
+memory (copy-on-grow). The compile gap is inherent to wazevo + this module; the
+execution gap is directly fixable with `WithMemoryCapacityFromMax` (bounded).
+
 ## Architecture
 
 ```
