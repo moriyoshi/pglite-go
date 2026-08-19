@@ -180,6 +180,20 @@ Solution: append `-D` after `--boot` flags (no database name follows); insert `-
 
 8. **VFS persistence**: The in-memory VFS loses all data when the process exits. For a production embeddable database, need to persist the VFS to disk (or implement a VFS layer backed by the host filesystem).
 
+## Startup Profile (warm cache, 2026-08-19)
+
+After the persistent compilation cache, a full warm run is **~11s** (cold first run ~164s). Breakdown:
+
+| Phase | Time | Nature |
+|-------|------|--------|
+| Cache deserialize + pre-compile | ~0.5s | fixed |
+| initdb setup + `postgres -V` probe | ~1.5s | 1 instantiation |
+| `postgres --boot` (953KB bootstrap SQL) | ~2.8s | DB bootstrap work |
+| `postgres --single` post-bootstrap (249KB SQL) | ~3.9s | DB bootstrap work |
+| Phase 2: actual query | ~1.1s | 1 instantiation |
+
+**~9s of the 11s is initdb**, which only needs to run once per data directory. The in-memory VFS is wiped on process exit, so the PoC re-runs initdb every start. The "open existing DB + query" path is only ~1.6s. The highest-value next startup lever is therefore VFS persistence (#8) — persist the data dir so initdb runs once, not per process.
+
 ## Timeline
 
 | Milestone | Status |
