@@ -215,6 +215,44 @@ Two subtleties handled:
   are now stored 0600 / dirs 0700 and reloaded as 0700/0600 — a valid strict
   PostgreSQL data-dir permission set. Covered by `vfs/persist_test.go`.
 
+## WASM Runtime Comparison (wasmtime vs wazero, 2026-08-19)
+
+Investigating alternate runtimes. Only compilation and instantiation are directly
+comparable without re-porting the entire host layer (VFS, 100+ syscalls, custom
+WASI, Emscripten invoke/longjmp, initdb bridge) — all currently written against
+wazero's Go API. Measured via `cmd/bench-wasmtime` and `cmd/probe-wasmtime`
+(wasmtime-go v34, Cranelift, x86_64 Mac):
+
+| Metric | wazero | wasmtime |
+|--------|--------|----------|
+| Compile `pglite.wasm` (8.7MB) | ~100–138s | **1.43s** (~70–95× faster) |
+| Serialized AOT artifact | ~34MB | 33.5MB |
+| Instantiate (all externs wired) | n/a | **0.002s** |
+
+Key findings:
+- **wasmtime's Cranelift compiles ~70× faster than wazero's compiler** — on wasmtime
+  the one-time cold-compile cost the disk cache was built to hide (item #6) largely
+  disappears (1.4s is negligible; parallelized across cores, 15.9s user time).
+- **No WASM binary patching needed on wasmtime.** wazero's `HostModuleBuilder` only
+  exports functions, forcing us to synthesize an `env.extras` module and patch the
+  guest to import globals/memory/table from it (`patch.go`). wasmtime accepts
+  `Global`/`Memory`/`Table` externs directly, so the module instantiates unmodified.
+- Imports to satisfy: `env`:122 funcs + memory + table + 3 globals, `GOT.mem`:1 global
+  (`__heap_base`), `wasi_snapshot_preview1`:13 funcs. Of the env funcs, ~87 are
+  `__syscall_*`, ~60 are `invoke_*` trampolines, the rest Emscripten runtime.
+
+**Execution port status (in progress):** The full port to actually run postgres on
+wasmtime is scoped and de-risked but incomplete (multi-session). Plan:
+1. Adapter implementing wazero's `api.Module`/`api.Memory` over wasmtime memory +
+   `Caller`, so the existing syscall/WASI Go closures are reused unchanged (they only
+   touch `mod.Memory()` (63×) and `mod.ExportedFunction()` (2×, the mmap path)).
+2. Re-implement `invoke_*`/`_emscripten_throw_longjmp`: on an indirect table call,
+   save stack (`emscripten_stack_get_current`), call `table[index]`, and on a longjmp
+   trap restore the stack + `setThrew(1,0)`. wasmtime resumes exports after a trap,
+   so this is viable (mirrors wazero's internal emscripten package).
+3. Port the initdb system/popen/pclose bridge (place wrapper funcs in the table).
+4. Wire `_mmap_js` into wasmtime linear memory + `emscripten_resize_heap`.
+
 ## Timeline
 
 | Milestone | Status |
@@ -234,6 +272,8 @@ Two subtleties handled:
 | SQL query execution (single-user mode) | Done (`SELECT 1+1` → result) |
 | Persistent (file-backed) compilation cache | Done (0.58s warm vs ~138s cold) |
 | VFS persistence + skip-initdb on restart | Done (2.3s restart vs 8.6s first run) |
+| wasmtime compile + instantiate benchmark | Done (1.43s compile, 0.002s instantiate) |
+| wasmtime full execution port | In progress (scoped, not yet running postgres) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |
