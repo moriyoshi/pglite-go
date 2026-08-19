@@ -223,11 +223,24 @@ WASI, Emscripten invoke/longjmp, initdb bridge) — all currently written agains
 wazero's Go API. Measured via `cmd/bench-wasmtime` and `cmd/probe-wasmtime`
 (wasmtime-go v34, Cranelift, x86_64 Mac):
 
-| Metric | wazero | wasmtime |
-|--------|--------|----------|
-| Compile `pglite.wasm` (8.7MB) | ~100–138s | **1.43s** (~70–95× faster) |
-| Serialized AOT artifact | ~34MB | 33.5MB |
-| Instantiate (all externs wired) | n/a | **0.002s** |
+| Metric | wazero | wasmtime | wasmedge |
+|--------|--------|----------|----------|
+| Compiler | own (optimizing) | Cranelift | LLVM -O2 |
+| Compile `pglite.wasm` (8.7MB) | ~100–138s | **1.43s** | 218s |
+| AOT artifact | ~34MB | 33.5MB | **20.6MB** (.so) |
+| Instantiate (all externs wired) | n/a | **0.002s** | not measured¹ |
+
+¹ wasmedge instantiate needs host imports wired via wasmedge-go; not measured here.
+wasmedge AOT breakdown: verify 1.8s, **optimize 101s**, **codegen 112s**, link 0.5s.
+wasmedge also has an interpreter mode (near-zero startup, slower execution) if AOT
+is skipped.
+
+**Reading the numbers:** compile-time ranking is wasmtime (1.4s) ≪ wazero (~120s) <
+wasmedge (218s), but this is *compile only* — execution speed likely inverts
+(LLVM-O2 ≥ Cranelift ≥ wazero). For an embeddable Postgres where cold-start matters,
+wasmtime's Cranelift is the clear compile-time winner; wasmedge's LLVM AOT only pays
+off if execution throughput dominates and the one-time 218s compile is cached to the
+.so. All three cache their AOT artifact to disk, amortizing compile across restarts.
 
 Key findings:
 - **wasmtime's Cranelift compiles ~70× faster than wazero's compiler** — on wasmtime
@@ -273,6 +286,7 @@ wasmtime is scoped and de-risked but incomplete (multi-session). Plan:
 | Persistent (file-backed) compilation cache | Done (0.58s warm vs ~138s cold) |
 | VFS persistence + skip-initdb on restart | Done (2.3s restart vs 8.6s first run) |
 | wasmtime compile + instantiate benchmark | Done (1.43s compile, 0.002s instantiate) |
+| wasmedge AOT compile benchmark | Done (218s LLVM-O2, 20.6MB .so) |
 | wasmtime full execution port | In progress (scoped, not yet running postgres) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
