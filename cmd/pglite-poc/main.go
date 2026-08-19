@@ -16,6 +16,45 @@ import (
 // Global compilation cache shared across all runtimes
 var compilationCache wazero.CompilationCache
 
+// dataPersistDir returns the host directory where the initialized PostgreSQL
+// data directory is persisted between runs.
+func dataPersistDir() string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return dir + "/pglite-go/data"
+	}
+	return ".pglite-data"
+}
+
+// isPersistedCluster reports whether persistDir holds a previously-initialized
+// cluster (identified by the presence of PG_VERSION).
+func isPersistedCluster(persistDir string) bool {
+	_, err := os.Stat(persistDir + "/PG_VERSION")
+	return err == nil
+}
+
+// runInitdbAndPersist runs initdb and, on success, saves the resulting data
+// directory to persistDir so subsequent starts can skip initdb.
+func runInitdbAndPersist(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte, dataDir, persistDir string) {
+	// initdb currently exits 1 on the post-bootstrap collation import (a known
+	// WASM-locale limitation), but the cluster it produces is otherwise valid.
+	// So persist based on the presence of the essential cluster files in the
+	// VFS rather than on initdb's exit code.
+	if err := runInitdb(ctx, fs, initdbWasm, postgresWasm); err != nil {
+		fmt.Fprintf(os.Stderr, "initdb reported: %v (continuing if cluster looks valid)\n", err)
+	}
+	for _, f := range []string{"/PG_VERSION", "/global/pg_control"} {
+		if _, err := fs.Stat(dataDir + f); err != nil {
+			fmt.Fprintf(os.Stderr, "not persisting: cluster incomplete (missing %s)\n", f)
+			return
+		}
+	}
+	if err := fs.SaveSubtree(dataDir, persistDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to persist data dir to %s: %v\n", persistDir, err)
+	} else {
+		fmt.Printf("Persisted data dir to %s\n", persistDir)
+	}
+}
+
 // wasmCacheDir returns a stable, per-user directory for wazero's persistent
 // compilation cache. Falls back to a repo-local dir if the OS cache dir is
 // unavailable.
@@ -72,10 +111,21 @@ func main() {
 	preR.Close(ctx)
 	fmt.Println("done")
 
-	fmt.Println("=== Phase 1: Running initdb ===")
-	err := runInitdb(ctx, fs, initdbWasm, postgresWasm)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "initdb error: %v\n", err)
+	// Persist the initdb-created data dir to the host so initdb (the ~9s
+	// dominant startup cost) runs only once. If a saved data dir exists, load
+	// it and skip initdb entirely — turning startup into the ~1.6s
+	// "open existing DB" path.
+	const dataDir = "/tmp/pglite/data"
+	persistDir := dataPersistDir()
+	if isPersistedCluster(persistDir) {
+		fmt.Printf("=== Phase 1: Loading persisted data dir from %s (skipping initdb) ===\n", persistDir)
+		if err := fs.LoadSubtree(persistDir, dataDir); err != nil {
+			fmt.Fprintf(os.Stderr, "load persisted data dir failed (%v); falling back to initdb\n", err)
+			runInitdbAndPersist(ctx, fs, initdbWasm, postgresWasm, dataDir, persistDir)
+		}
+	} else {
+		fmt.Println("=== Phase 1: Running initdb ===")
+		runInitdbAndPersist(ctx, fs, initdbWasm, postgresWasm, dataDir, persistDir)
 	}
 
 	// Check if initdb created the expected files
@@ -88,8 +138,7 @@ func main() {
 	}
 
 	fmt.Println("\n=== Phase 2: Starting PostgreSQL ===")
-	err = runPostgres(ctx, fs, postgresWasm)
-	if err != nil {
+	if err := runPostgres(ctx, fs, postgresWasm); err != nil {
 		fmt.Fprintf(os.Stderr, "postgres error: %v\n", err)
 	}
 }

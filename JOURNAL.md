@@ -178,7 +178,7 @@ Solution: append `-D` after `--boot` flags (no database name follows); insert `-
 
 7. **Single-instance reuse**: Each postgres subcommand currently creates a new wazero runtime (compile → instantiate → run → close). PGlite's JS version reuses a single WASM instance with heap restoration (`HEAPU8.set(origHEAPU8)`) for dramatically faster repeated calls. Implementing this pattern in wazero would require snapshotting/restoring WASM linear memory.
 
-8. **VFS persistence**: The in-memory VFS loses all data when the process exits. For a production embeddable database, need to persist the VFS to disk (or implement a VFS layer backed by the host filesystem).
+8. ~~**VFS persistence**~~ **DONE.** The data dir is persisted to the host FS after initdb via `vfs.SaveSubtree`/`LoadSubtree`, and reloaded on startup to skip initdb (see "VFS persistence" under Startup Profile). Note this persists a *snapshot* of the data dir at initdb time; live persistence of ongoing writes (or a fully host-FS-backed VFS layer) is still future work for durability across a running session.
 
 ## Startup Profile (warm cache, 2026-08-19)
 
@@ -193,6 +193,27 @@ After the persistent compilation cache, a full warm run is **~11s** (cold first 
 | Phase 2: actual query | ~1.1s | 1 instantiation |
 
 **~9s of the 11s is initdb**, which only needs to run once per data directory. The in-memory VFS is wiped on process exit, so the PoC re-runs initdb every start. The "open existing DB + query" path is only ~1.6s. The highest-value next startup lever is therefore VFS persistence (#8) — persist the data dir so initdb runs once, not per process.
+
+### VFS persistence (DONE, 2026-08-19)
+
+Implemented in `vfs/persist.go`: `SaveSubtree(vfsPath, hostDir)` mirrors a VFS
+subtree to the host FS; `LoadSubtree(hostDir, vfsPath)` mirrors it back. The PoC
+now saves `/tmp/pglite/data` after initdb and, on startup, if a persisted cluster
+exists (`PG_VERSION` present), loads it and **skips initdb entirely**.
+
+Result: **first run 8.6s (initdb + persist) → subsequent runs 2.3s** (load + query),
+matching the predicted "open existing DB" path. `SELECT 1+1` returns `2` on the
+reloaded cluster.
+
+Two subtleties handled:
+- **Persist despite initdb exit 1.** initdb exits 1 on the collation import but
+  produces a valid cluster; the PoC persists based on the presence of essential
+  files (`PG_VERSION`, `global/pg_control`) in the VFS, not initdb's exit code.
+- **Host storage perms are decoupled from VFS modes.** initdb marks some files
+  read-restricted (e.g. mode 0); writing those to the host with their VFS mode
+  made them unreadable on reload, silently aborting the load partway. Host files
+  are now stored 0600 / dirs 0700 and reloaded as 0700/0600 — a valid strict
+  PostgreSQL data-dir permission set. Covered by `vfs/persist_test.go`.
 
 ## Timeline
 
@@ -212,6 +233,7 @@ After the persistent compilation cache, a full warm run is **~11s** (cold first 
 | PostgreSQL single-user mode start | Done (checkpoint works, 8 buffers, 7 sync files) |
 | SQL query execution (single-user mode) | Done (`SELECT 1+1` → result) |
 | Persistent (file-backed) compilation cache | Done (0.58s warm vs ~138s cold) |
+| VFS persistence + skip-initdb on restart | Done (2.3s restart vs 8.6s first run) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |
