@@ -4,6 +4,52 @@
 
 Embed PostgreSQL in Go by combining [PGlite](https://github.com/electric-sql/pglite) (PostgreSQL compiled to WASM via Emscripten) with [wazero](https://github.com/tetratelabs/wazero) (pure Go WebAssembly runtime).
 
+## Work Summary — 2026-08-19 (startup perf + runtime benchmark + wasmtime port)
+
+Focused on startup latency, then a cross-runtime benchmark that grew into a working
+port onto a second WASM runtime. Full detail in the sections below; the highlights:
+
+### Startup latency, mitigated (~164s → ~2.3s warm restart)
+1. **Persistent compilation cache.** The 8.7MB `pglite.wasm` was AOT-recompiled on
+   every start (~138s) because the wazero cache was in-memory only. Switched to
+   `NewCompilationCacheWithDir` (disk-backed). **Warm start compiles in 0.58s (~170×
+   faster).** Cold first run still ~100s (one-time). — `cmd/pglite-poc/main.go`.
+2. **VFS persistence + skip initdb.** initdb was ~9s of the ~11s warm run and only
+   needs to run once per data dir, but the in-memory VFS was wiped on exit. Added
+   `vfs.SaveSubtree`/`LoadSubtree` to mirror the data dir to/from the host FS; the PoC
+   now loads a persisted cluster and **skips initdb entirely** → first run 8.6s,
+   **subsequent runs 2.3s**. `SELECT 1+1` returns `2` on the reloaded cluster.
+   - Gotcha: persist by *cluster validity* (PG_VERSION + global/pg_control present),
+     not initdb's exit code (initdb exits 1 on the known collation import).
+   - Gotcha: decouple host storage perms (0600/0700) from VFS modes — initdb marks
+     some files unreadable (mode 0), which silently aborted reload mid-walk.
+
+### Cross-runtime benchmark (wazero vs wasmtime vs wasmedge)
+- **Compile time: wasmtime 1.43s (Cranelift) ≪ wazero ~120s < wasmedge 218s (LLVM-O2).**
+  On wasmtime the one-time cold-compile cost the disk cache exists to hide largely
+  disappears. Execution speed likely inverts (LLVM ≥ Cranelift ≥ wazero) — not yet
+  measured. Artifacts: wazero ~34MB, wasmtime 33.5MB, wasmedge 20.6MB.
+- **wasmtime instantiates in 0.002s with no binary patching** — it accepts
+  global/memory/table imports natively, so `env.extras`/`patch.go` (a wazero
+  function-only-host-module workaround) is unnecessary.
+
+### wasmtime execution port — PostgreSQL runs on wasmtime
+- `postgres -V` → "PostgreSQL 17.5", exit 0, on wasmtime (not wazero). Proves the
+  whole path: compile+instantiate (1.5s), data relocs, C++ static ctors via the
+  invoke_/longjmp trampolines (the documented libc++ crash, handled), argv, WASI stdout.
+- Key techniques: (a) reuse the *exact* wazero Go closures by defeating wazero's
+  sealed `api.Module`/`api.Memory` via interface-embedding; (b) re-implement
+  `invoke_*`/`_emscripten_throw_longjmp` with wasmtime trap-and-resume.
+- Behind `//go:build wasmtime`; the default CGo-free wazero build is untouched.
+- Remaining (task #4): the initdb system/popen/pclose bridge (simpler on wasmtime via
+  `table.Set`) → full initdb + `SELECT 1+1` → end-to-end execution benchmark.
+
+### New tooling
+`cmd/bench-wasmtime` (compile timing), `cmd/dump-imports` (import inventory),
+`cmd/probe-wasmtime` (instantiation probe), `cmd/pglite-wasmtime` (execution port),
+`emscripten/wasmtime_port.go` (adapters + invoke/longjmp), `vfs/persist.go` +
+`vfs/persist_test.go` (data-dir persistence).
+
 ## Architecture
 
 ```
