@@ -42,17 +42,24 @@ type WTRuntime struct {
 }
 
 // NewWTRuntime compiles the given (unpatched) pglite.wasm and wires all host
-// imports. stdinData feeds WASI stdin; if stdoutCapture is non-nil, stdout is
-// captured into it instead of os.Stdout.
+// imports. Convenience wrapper around NewWTRuntimeFromModule that compiles the
+// bytes each call — prefer compiling once and reusing the module across
+// subcommands (see NewWTRuntimeFromModule).
 func NewWTRuntime(ctx context.Context, engine *wasmtime.Engine, wasmBytes []byte, fs *vfs.FS, stdinData []byte, stdoutCapture *[]byte) (*WTRuntime, error) {
-	rt := &WTRuntime{ctx: ctx, engine: engine, fs: fs}
-	store := wasmtime.NewStore(engine)
-	rt.store = store
-
 	mod, err := wasmtime.NewModule(engine, wasmBytes)
 	if err != nil {
 		return nil, fmt.Errorf("compile: %w", err)
 	}
+	return NewWTRuntimeFromModule(ctx, engine, mod, fs, stdinData, stdoutCapture)
+}
+
+// NewWTRuntimeFromModule wires host imports for an already-compiled module and
+// instantiates it. A wasmtime.Module can be instantiated into many stores, so
+// compiling once and reusing it across subcommands avoids recompiling.
+func NewWTRuntimeFromModule(ctx context.Context, engine *wasmtime.Engine, mod *wasmtime.Module, fs *vfs.FS, stdinData []byte, stdoutCapture *[]byte) (*WTRuntime, error) {
+	rt := &WTRuntime{ctx: ctx, engine: engine, fs: fs}
+	store := wasmtime.NewStore(engine)
+	rt.store = store
 	rt.module = mod
 
 	// Derive the imported memory and table types from the module itself

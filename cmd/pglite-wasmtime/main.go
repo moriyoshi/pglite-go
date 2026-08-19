@@ -22,7 +22,10 @@ import (
 
 const dataDir = "/tmp/pglite/data"
 
-var engine *wasmtime.Engine
+var (
+	engine     *wasmtime.Engine
+	postgresMod *wasmtime.Module // compiled once, reused across all subcommands
+)
 
 func main() {
 	wasmDir := "wasm"
@@ -47,6 +50,14 @@ func main() {
 	engine = wasmtime.NewEngine()
 
 	total := time.Now()
+	comp := time.Now()
+	var cerr error
+	if postgresMod, cerr = wasmtime.NewModule(engine, postgresWasm); cerr != nil {
+		fmt.Fprintf(os.Stderr, "compile pglite.wasm: %v\n", cerr)
+		os.Exit(1)
+	}
+	fmt.Printf("[wasmtime] compiled pglite.wasm once in %.2fs (reused across subcommands)\n", time.Since(comp).Seconds())
+
 	fmt.Println("=== Phase 1: initdb (on wasmtime) ===")
 	if err := runInitdb(ctx, fs, initdbWasm, postgresWasm); err != nil {
 		fmt.Fprintf(os.Stderr, "initdb: %v\n", err)
@@ -71,9 +82,10 @@ func main() {
 	fmt.Printf("\n[wasmtime] total wall time: %.2fs\n", time.Since(total).Seconds())
 }
 
-// runCmd runs a postgres subcommand in a fresh wasmtime instance.
+// runCmd runs a postgres subcommand in a fresh wasmtime instance, reusing the
+// once-compiled postgres module (the wasm arg is ignored for postgres).
 func runCmd(ctx context.Context, fs *vfs.FS, wasm []byte, args []string, stdin []byte, stdoutCapture *[]byte) int32 {
-	rt, err := emcompat.NewWTRuntime(ctx, engine, wasm, fs, stdin, stdoutCapture)
+	rt, err := emcompat.NewWTRuntimeFromModule(ctx, engine, postgresMod, fs, stdin, stdoutCapture)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[pg] runtime: %v\n", err)
 		return -1

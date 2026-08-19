@@ -33,16 +33,18 @@ port onto a second WASM runtime. Full detail in the sections below; the highligh
   global/memory/table imports natively, so `env.extras`/`patch.go` (a wazero
   function-only-host-module workaround) is unnecessary.
 
-### wasmtime execution port — PostgreSQL runs on wasmtime
-- `postgres -V` → "PostgreSQL 17.5", exit 0, on wasmtime (not wazero). Proves the
-  whole path: compile+instantiate (1.5s), data relocs, C++ static ctors via the
-  invoke_/longjmp trampolines (the documented libc++ crash, handled), argv, WASI stdout.
+### wasmtime execution port — full PostgreSQL runs on wasmtime
+- **End to end:** initdb builds a full cluster and `SELECT 1+1` returns `2` on
+  wasmtime, matching wazero exactly. Full flow **2.93s** (1.36s compile + ~1.57s
+  execution) vs wazero's **~11s** warm — **wasmtime executes ~6–7× faster** (Cranelift
+  native code). Faster on both axes: ~70× cold compile and several× execution.
 - Key techniques: (a) reuse the *exact* wazero Go closures by defeating wazero's
   sealed `api.Module`/`api.Memory` via interface-embedding; (b) re-implement
-  `invoke_*`/`_emscripten_throw_longjmp` with wasmtime trap-and-resume.
+  `invoke_*`/`_emscripten_throw_longjmp` with wasmtime trap-and-resume; (c) initdb
+  system/popen/pclose bridge via `table.Grow`+`table.Set` (simpler than wazero's
+  element-segment module); (d) compile the module once, instantiate into many stores.
 - Behind `//go:build wasmtime`; the default CGo-free wazero build is untouched.
-- Remaining (task #4): the initdb system/popen/pclose bridge (simpler on wasmtime via
-  `table.Set`) → full initdb + `SELECT 1+1` → end-to-end execution benchmark.
+  Run: `go run -tags wasmtime ./cmd/pglite-wasmtime`.
 
 ### New tooling
 `cmd/bench-wasmtime` (compile timing), `cmd/dump-imports` (import inventory),
@@ -319,13 +321,30 @@ WASI stdout. What worked:
 3. **No binary patching / no env.extras.** Globals, memory, and table are native
    wasmtime externs.
 
-Remaining for full end-to-end (initdb + `SELECT 1+1`) on wasmtime — task #4:
-- Port the initdb system/popen/pclose bridge. On wasmtime this is *simpler*: place
-  the callback funcs directly with `table.Set(store, idx, funcref)` instead of
-  wazero's synthesized element-segment bridge module.
-- An instance-backed (not `Caller`-backed) module adapter for the Go-side
-  orchestration callbacks, nested `WTRuntime` per subcommand, `_mmap_js` during
-  `--boot`, and stdout-capture toggling. Then benchmark end-to-end vs wazero.
+**Full end-to-end runs on wasmtime (DONE).** initdb (with the system/popen/pclose
+bridge) builds a complete cluster and `SELECT 1+1` returns `2`, matching wazero
+exactly — including the expected `pg_import_system_collations` exit-1 (`locale -a`
+unimplemented in WASM). The initdb bridge is *simpler* on wasmtime: instead of
+wazero's synthesized element-segment bridge module, `table.Grow` + `table.Set` place
+the three Go callbacks directly, then `pgl_set_{system,popen,pclose}_fn` point initdb
+at them. Also needed: an instance-backed module adapter (for Go-side orchestration),
+nested runtimes per subcommand, `_mmap_js` during `--boot`, stdout-capture toggling,
+and deriving memory/table types per-module (pglite vs initdb differ).
+
+**End-to-end execution benchmark (the payoff — compile-time ranking inverts):**
+
+| Full initdb + `SELECT 1+1` | wazero (warm disk cache) | wasmtime (compile once, reuse) |
+|----------------------------|--------------------------|--------------------------------|
+| Compile | ~0.6s (deserialize 34MB) | 1.36s (fresh; no cache yet) |
+| initdb + query (execution) | ~10.5s | **~1.57s** |
+| **Total** | **~11s** | **2.93s** |
+
+Reusing the compiled `wasmtime.Module` across subcommands (one Module → many stores)
+cut the wasmtime total from 7.46s to 2.93s. **wasmtime executes the initdb+query
+~6–7× faster than wazero** (Cranelift native code vs wazero's), confirming the
+prediction that execution speed inverts the compile-time ranking. Net: wasmtime is
+faster on *both* axes here — ~70× faster cold compile and several× faster execution.
+A wasmtime compile cache (not yet added) would drop its total to ~1.6s.
 
 ## Timeline
 
@@ -349,7 +368,7 @@ Remaining for full end-to-end (initdb + `SELECT 1+1`) on wasmtime — task #4:
 | wasmtime compile + instantiate benchmark | Done (1.43s compile, 0.002s instantiate) |
 | wasmedge AOT compile benchmark | Done (218s LLVM-O2, 20.6MB .so) |
 | wasmtime execution port: postgres -V runs | Done (1.5s compile+instantiate+run) |
-| wasmtime full initdb + SELECT | In progress (initdb bridge remaining) |
+| wasmtime full initdb + SELECT 1+1 | Done (2.93s total vs wazero ~11s) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |
