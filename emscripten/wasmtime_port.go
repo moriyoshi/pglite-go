@@ -55,13 +55,25 @@ func NewWTRuntime(ctx context.Context, engine *wasmtime.Engine, wasmBytes []byte
 	}
 	rt.module = mod
 
-	// Imported memory (min 2048 pages / 128MB, max 32768 / 2GB) and table.
-	memory, err := wasmtime.NewMemory(store, wasmtime.NewMemoryType(2048, true, 32768, false))
+	// Derive the imported memory and table types from the module itself
+	// (pglite.wasm and initdb.wasm differ in min sizes).
+	memType := wasmtime.NewMemoryType(2048, true, 32768, false)
+	tableMin := uint32(6097)
+	for _, imp := range mod.Imports() {
+		if mt := imp.Type().MemoryType(); mt != nil {
+			hasMax, max := mt.Maximum()
+			memType = wasmtime.NewMemoryType(uint32(mt.Minimum()), hasMax, uint32(max), false)
+		}
+		if tt := imp.Type().TableType(); tt != nil {
+			tableMin = tt.Minimum()
+		}
+	}
+	memory, err := wasmtime.NewMemory(store, memType)
 	if err != nil {
 		return nil, fmt.Errorf("memory: %w", err)
 	}
 	rt.memory = memory
-	table, err := wasmtime.NewTable(store, wasmtime.NewTableType(wasmtime.NewValType(wasmtime.KindFuncref), 6097, false, 0), wasmtime.ValFuncref(nil))
+	table, err := wasmtime.NewTable(store, wasmtime.NewTableType(wasmtime.NewValType(wasmtime.KindFuncref), tableMin, false, 0), wasmtime.ValFuncref(nil))
 	if err != nil {
 		return nil, fmt.Errorf("table: %w", err)
 	}
@@ -238,24 +250,36 @@ type wtModule struct {
 	caller *wasmtime.Caller
 }
 
-func (m *wtModule) Memory() api.Memory {
-	ext := m.caller.GetExport("memory")
-	if ext == nil {
-		return &wtMemory{mem: m.rt.memory, store: m.caller}
+// storelike returns the caller when inside a host call, else the runtime store.
+func (m *wtModule) storelike() wasmtime.Storelike {
+	if m.caller != nil {
+		return m.caller
 	}
-	return &wtMemory{mem: ext.Memory(), store: m.caller}
+	return m.rt.store
+}
+
+func (m *wtModule) Memory() api.Memory {
+	if m.caller != nil {
+		if ext := m.caller.GetExport("memory"); ext != nil {
+			return &wtMemory{mem: ext.Memory(), store: m.caller}
+		}
+	}
+	return &wtMemory{mem: m.rt.memory, store: m.storelike()}
 }
 
 func (m *wtModule) ExportedFunction(name string) api.Function {
-	ext := m.caller.GetExport(name)
-	if ext == nil {
-		return nil
+	var f *wasmtime.Func
+	if m.caller != nil {
+		if ext := m.caller.GetExport(name); ext != nil {
+			f = ext.Func()
+		}
+	} else {
+		f = m.rt.instance.GetFunc(m.rt.store, name)
 	}
-	f := ext.Func()
 	if f == nil {
 		return nil
 	}
-	return &wtFunction{fn: f, store: m.caller, name: name}
+	return &wtFunction{fn: f, store: m.storelike(), name: name}
 }
 
 func (m *wtModule) Name() string { return "pglite" }
@@ -536,6 +560,79 @@ func callExport(caller *wasmtime.Caller, name string, args ...interface{}) (inte
 		return nil, wasmtime.NewTrap(err.Error())
 	}
 	return res, nil
+}
+
+// ModuleAdapter returns an instance-backed api.Module for use by Go-side
+// orchestration (e.g. InitdbCallbacks) outside of host callbacks.
+func (rt *WTRuntime) ModuleAdapter() api.Module { return &wtModule{rt: rt} }
+
+// CallExport calls an exported function by name with the given Go-typed args
+// (int32/int64/float64) and returns wasmtime's raw result (nil / value / []Val).
+func (rt *WTRuntime) CallExport(name string, args ...interface{}) (interface{}, error) {
+	f := rt.instance.GetFunc(rt.store, name)
+	if f == nil {
+		return nil, fmt.Errorf("export %q not found", name)
+	}
+	return f.Call(rt.store, args...)
+}
+
+// RegisterInitdbCallbacks appends the system/popen/pclose callbacks to the
+// shared table (growing it so they can't collide with initdb's own functions)
+// and points cb.memory/Module at this instance. Returns the base table index;
+// initdb is told to use them via pgl_set_system_fn(base+0), etc.
+func (rt *WTRuntime) RegisterInitdbCallbacks(cb *InitdbCallbacks) (uint32, error) {
+	cb.SetModule(rt.ModuleAdapter())
+
+	base := uint32(rt.table.Size(rt.store))
+	if _, err := rt.table.Grow(rt.store, 3, wasmtime.ValFuncref(nil)); err != nil {
+		return 0, fmt.Errorf("grow table: %w", err)
+	}
+
+	readStr := func(caller *wasmtime.Caller, ptr int32) string {
+		mem := rt.memory
+		if e := caller.GetExport("memory"); e != nil {
+			mem = e.Memory()
+		}
+		data := mem.UnsafeData(caller)
+		var b []byte
+		for p := uint32(uint32(ptr)); p < uint32(len(data)) && data[p] != 0; p++ {
+			b = append(b, data[p])
+		}
+		return string(b)
+	}
+
+	i32 := wasmtime.NewValType(wasmtime.KindI32)
+	ft1 := wasmtime.NewFuncType([]*wasmtime.ValType{i32}, []*wasmtime.ValType{i32})
+	ft2 := wasmtime.NewFuncType([]*wasmtime.ValType{i32, i32}, []*wasmtime.ValType{i32})
+
+	systemFn := wasmtime.NewFunc(rt.store, ft1, func(caller *wasmtime.Caller, args []wasmtime.Val) ([]wasmtime.Val, *wasmtime.Trap) {
+		ret := int32(-1)
+		if cb.OnSystem != nil {
+			ret = cb.OnSystem(rt.ctx, readStr(caller, args[0].I32()))
+		}
+		return []wasmtime.Val{wasmtime.ValI32(ret)}, nil
+	})
+	popenFn := wasmtime.NewFunc(rt.store, ft2, func(caller *wasmtime.Caller, args []wasmtime.Val) ([]wasmtime.Val, *wasmtime.Trap) {
+		ret := int32(0)
+		if cb.OnPopen != nil {
+			ret = cb.OnPopen(rt.ctx, readStr(caller, args[0].I32()), readStr(caller, args[1].I32()))
+		}
+		return []wasmtime.Val{wasmtime.ValI32(ret)}, nil
+	})
+	pcloseFn := wasmtime.NewFunc(rt.store, ft1, func(_ *wasmtime.Caller, args []wasmtime.Val) ([]wasmtime.Val, *wasmtime.Trap) {
+		ret := int32(0)
+		if cb.OnPclose != nil {
+			ret = cb.OnPclose(rt.ctx, args[0].I32())
+		}
+		return []wasmtime.Val{wasmtime.ValI32(ret)}, nil
+	})
+
+	for i, fn := range []*wasmtime.Func{systemFn, popenFn, pcloseFn} {
+		if err := rt.table.Set(rt.store, uint64(base)+uint64(i), wasmtime.ValFuncref(fn)); err != nil {
+			return 0, fmt.Errorf("table.Set %d: %w", base+uint32(i), err)
+		}
+	}
+	return base, nil
 }
 
 // ApplyDataRelocs runs __wasm_apply_data_relocs if the module exports it.
