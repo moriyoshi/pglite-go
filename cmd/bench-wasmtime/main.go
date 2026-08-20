@@ -1,3 +1,5 @@
+//go:build !wazero
+
 // Command bench-wasmtime measures how long wasmtime takes to compile
 // pglite.wasm, for comparison against wazero's compile time.
 package main

@@ -1,10 +1,11 @@
-//go:build wasmtime
+//go:build !wazero
 
-// Command pglite-wasmtime runs the full PGlite flow (initdb + a SQL query) on
-// wasmtime instead of wazero, to validate the execution port end-to-end and
-// benchmark it against the wazero PoC.
+// Command pglite is the primary entrypoint: it runs the full PGlite flow
+// (initdb + a SQL query) on wasmtime, the project's default runtime. The
+// pure-Go wazero implementation lives in cmd/pglite-poc behind `-tags wazero`.
 //
-//	go run -tags wasmtime ./cmd/pglite-wasmtime
+//	go run ./cmd/pglite              # wasmtime (default)
+//	go run -tags wazero ./cmd/pglite-poc   # wazero fallback (pure Go)
 package main
 
 import (

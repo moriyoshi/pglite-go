@@ -2,7 +2,20 @@
 
 ## Project Goal
 
-Embed PostgreSQL in Go by combining [PGlite](https://github.com/electric-sql/pglite) (PostgreSQL compiled to WASM via Emscripten) with [wazero](https://github.com/tetratelabs/wazero) (pure Go WebAssembly runtime).
+Embed PostgreSQL in Go by running [PGlite](https://github.com/electric-sql/pglite) (PostgreSQL compiled to WASM via Emscripten) on a WebAssembly runtime, with a hand-written Emscripten + WASI host layer and an in-memory VFS.
+
+**Runtime: wasmtime is the primary/default path** (fastest compile + execution, only healthy Go binding); [wazero](https://github.com/tetratelabs/wazero) (pure Go, no CGo) is the fallback behind `-tags wazero`. Build/run:
+
+```
+go run ./cmd/pglite                        # wasmtime (default, needs CGo)
+CGO_ENABLED=0 go run -tags wazero ./cmd/pglite-poc   # wazero (pure Go fallback)
+```
+
+Build-tag scheme: wasmtime files are `//go:build !wazero` (default-on); the wazero
+command + its mmap allocator are `//go:build wazero`. The shared host layer
+(`emscripten` core, `vfs`) is untagged. So the default build is CGo/wasmtime and the
+`-tags wazero` build is pure Go (`CGO_ENABLED=0`). See the runtime comparison below for
+why wasmtime is primary.
 
 ## Work Summary — 2026-08-19 (startup perf + runtime benchmark + wasmtime port)
 
@@ -43,12 +56,13 @@ port onto a second WASM runtime. Full detail in the sections below; the highligh
   `invoke_*`/`_emscripten_throw_longjmp` with wasmtime trap-and-resume; (c) initdb
   system/popen/pclose bridge via `table.Grow`+`table.Set` (simpler than wazero's
   element-segment module); (d) compile the module once, instantiate into many stores.
-- Behind `//go:build wasmtime`; the default CGo-free wazero build is untouched.
-  Run: `go run -tags wasmtime ./cmd/pglite-wasmtime`.
+- Now the **default** path (`//go:build !wazero`); the wazero build is `-tags wazero`.
+  Run: `go run ./cmd/pglite`.
 
 ### New tooling
-`cmd/bench-wasmtime` (compile timing), `cmd/dump-imports` (import inventory),
-`cmd/probe-wasmtime` (instantiation probe), `cmd/pglite-wasmtime` (execution port),
+`cmd/pglite` (primary wasmtime entrypoint), `cmd/pglite-poc` (wazero fallback, `-tags
+wazero`), `cmd/bench-wasmtime` (compile timing), `cmd/dump-imports` (import inventory),
+`cmd/probe-wasmtime` / `cmd/probe-wasmedge` (instantiation probes),
 `emscripten/wasmtime_port.go` (adapters + invoke/longjmp), `vfs/persist.go` +
 `vfs/persist_test.go` (data-dir persistence).
 
@@ -133,8 +147,11 @@ pglite-go/
 ├── vfs/
 │   └── vfs.go          # In-memory virtual filesystem
 ├── cmd/
-│   ├── pglite-poc/     # PoC launcher (initdb + postgres)
-│   └── inspect-wasm/   # WASM import/export inspector
+│   ├── pglite/         # PRIMARY launcher — wasmtime (default, //go:build !wazero)
+│   ├── pglite-poc/     # wazero fallback launcher (//go:build wazero, pure Go)
+│   └── ...             # bench-wasmtime, dump-imports, probe-wasmtime, probe-wasmedge, prof-compile
+├── emscripten/
+│   └── wasmtime_port.go # wasmtime backend adapters (//go:build !wazero)
 └── scripts/
     └── download-wasm.sh  # Downloads PGlite WASM from npm
 ```

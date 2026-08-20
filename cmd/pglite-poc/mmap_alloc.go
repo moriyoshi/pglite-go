@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build wazero && (darwin || linux)
 
 package main
 

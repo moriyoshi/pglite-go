@@ -1,3 +1,9 @@
+//go:build wazero
+
+// Command pglite-poc is the pure-Go wazero fallback (no CGo). The primary
+// wasmtime path is cmd/pglite. Build/run with:
+//
+//	CGO_ENABLED=0 go run -tags wazero ./cmd/pglite-poc
 package main
 
 import (

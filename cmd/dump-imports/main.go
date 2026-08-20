@@ -1,3 +1,5 @@
+//go:build !wazero
+
 // Command dump-imports lists every import of a wasm module with its extern
 // kind, to plan the wasmtime host layer.
 package main

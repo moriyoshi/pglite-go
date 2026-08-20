@@ -1,6 +1,6 @@
-//go:build wasmtime
+//go:build !wazero
 
-// Package emscripten — wasmtime backend.
+// Package emscripten — wasmtime backend (the default).
 //
 // This file re-hosts the exact same Go syscall/WASI/runtime closures used by the
 // wazero path (all api.GoModuleFunc) on top of wasmtime-go, via small adapters
@@ -8,7 +8,8 @@
 // re-implements the Emscripten invoke_*/longjmp trampolines (which wazero
 // provided built-in) using wasmtime's trap-and-resume behavior.
 //
-// Build/run with: go run -tags wasmtime ./cmd/pglite-wasmtime
+// Built by default; excluded from the pure-Go build via `-tags wazero`.
+// Run: go run ./cmd/pglite
 package emscripten
 
 import (

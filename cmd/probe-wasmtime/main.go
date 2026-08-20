@@ -1,3 +1,5 @@
+//go:build !wazero
+
 // Command probe-wasmtime wires the minimal externs pglite.wasm imports
 // (memory, table, globals) with no-op function stubs, then attempts to
 // instantiate and measure instantiation time + how far the start function gets.
