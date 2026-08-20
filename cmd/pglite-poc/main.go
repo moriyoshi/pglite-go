@@ -96,7 +96,11 @@ func main() {
 	fs.WriteFile("/dev/urandom", nil, 0o666)
 	fs.MkdirAll("/home/web_user", 0o755)
 
-	ctx := context.Background()
+	// Back linear memory with an mmap allocator (on supported platforms) so
+	// memory.grow reslices the reserved mapping instead of realloc+memmove'ing
+	// the whole linear memory on every heap growth. The allocator is read from
+	// the context at instantiation time, so wrap the base context once here.
+	ctx := withMemoryAllocator(context.Background())
 	rawPostgresWasm, _ := os.ReadFile(wasmDir + "/pglite.wasm")
 	rawInitdbWasm, _ := os.ReadFile(wasmDir + "/initdb.wasm")
 

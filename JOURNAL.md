@@ -89,14 +89,29 @@ memory** whenever `newPages > Cap`. PostgreSQL grows its heap incrementally
 is copied over and over. wasmtime reserves the max via mmap and commits pages, so it
 never copies.
 
-**Validated fix:** `RuntimeConfig.WithMemoryCapacityFromMax(true)` sets `Cap = Max`
-up front, so `Grow` takes the "already have capacity" branch and just reslices — no
-copy. Measured on the heavy workload: execution **0.41s → 0.30s (~27% faster)** and
-`MemoryInstance.Grow`/`memmove`-from-grow vanish from the profile (CPU samples
-260ms → 130ms). Caveat: it eagerly allocates the declared max (here 2GB) — so also
-lower `env.extras`'s declared memory max (e.g. to 8192–16384 pages = 512MB–1GB) to
-bound the one-time allocation, or plug in an mmap-based `experimental.MemoryAllocator`.
-Not yet wired into `cmd/pglite-poc` (needs the bounded-max change + revalidation).
+**First attempt (`WithMemoryCapacityFromMax(true)`) — regressed the PoC.** It sets
+`Cap = Max` so `Grow` reslices instead of copying, and on the synthetic 200k-row query
+it helped (0.41s → 0.30s). But on the real full initdb + query it made things *worse*
+(3 runs each):
+
+| config | time | peak RSS |
+|--------|------|----------|
+| baseline (copy-on-grow) | ~2.03s | ~877MB |
+| `WithMemoryCapacityFromMax(true)` | ~3.5s | **3398MB** |
+| **mmap allocator (applied)** | **~1.83s** | **~320MB** |
+
+Capacity-from-max eagerly reserves *and commits* the declared 2GB max **per
+subcommand** (~5 postgres processes per run); that churn outweighs the grow-copy
+savings. The assumption that Go keeps the 2GB reservation lazily-uncommitted was wrong.
+
+**Applied fix: an mmap allocator** (`cmd/pglite-poc/mmap_alloc.go`, wired via
+`experimental.WithMemoryAllocator` on the base context). It backs linear memory with an
+anonymous `mmap` of the declared max: `Reallocate` reslices the *same* mapping (no copy
+on grow) and the OS commits pages lazily on touch (RSS tracks real usage). Result on the
+full initdb + query: **~10% faster (2.03s → 1.83s) and 2.7× less memory (877MB →
+320MB)**, query still returns `2`. `//go:build darwin || linux` with a no-op fallback
+elsewhere. This is exactly prescription B.1 (an mmap-reserve allocator) validated on the
+real workload.
 
 ### Net
 wazero is slow for two independent, structural reasons tied to how this particular
