@@ -67,16 +67,18 @@ func main() {
 	}
 	fmt.Printf("[wasmtime] %s pglite.wasm in %.2fs (reused across subcommands)\n", how, time.Since(comp).Seconds())
 
-	fmt.Println("=== Phase 1: initdb (on wasmtime) ===")
-	if err := runInitdb(ctx, fs, initdbWasm, postgresWasm); err != nil {
-		fmt.Fprintf(os.Stderr, "initdb: %v\n", err)
-	}
-	for _, p := range []string{dataDir + "/global/pg_control", dataDir + "/PG_VERSION", dataDir + "/postgresql.conf"} {
-		if _, err := fs.Stat(p); err != nil {
-			fmt.Printf("  MISSING: %s\n", p)
-		} else {
-			fmt.Printf("  EXISTS: %s\n", p)
+	// Persist the initdb-created data dir to the host so initdb runs once, not
+	// on every start. If a saved cluster exists, load it and skip initdb.
+	persistDir := dataPersistDir()
+	if isPersistedCluster(persistDir) {
+		fmt.Printf("=== Phase 1: loading persisted data dir from %s (skipping initdb) ===\n", persistDir)
+		if err := fs.LoadSubtree(persistDir, dataDir); err != nil {
+			fmt.Fprintf(os.Stderr, "load persisted data dir failed (%v); running initdb\n", err)
+			runInitdbAndPersist(ctx, fs, initdbWasm, postgresWasm, persistDir)
 		}
+	} else {
+		fmt.Println("=== Phase 1: initdb (on wasmtime) ===")
+		runInitdbAndPersist(ctx, fs, initdbWasm, postgresWasm, persistDir)
 	}
 
 	fmt.Println("\n=== Phase 2: SELECT 1+1 (on wasmtime) ===")
@@ -89,6 +91,44 @@ func main() {
 		fmt.Printf("Output:\n%s\n", string(out))
 	}
 	fmt.Printf("\n[wasmtime] total wall time: %.2fs\n", time.Since(total).Seconds())
+}
+
+// dataPersistDir returns the host directory where the initialized cluster is
+// persisted between runs.
+func dataPersistDir() string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return dir + "/pglite-go/data"
+	}
+	return ".pglite-data"
+}
+
+// isPersistedCluster reports whether persistDir holds a previously-initialized
+// cluster (identified by PG_VERSION).
+func isPersistedCluster(persistDir string) bool {
+	_, err := os.Stat(persistDir + "/PG_VERSION")
+	return err == nil
+}
+
+// runInitdbAndPersist runs initdb and, if it produced a valid cluster, saves the
+// data dir so subsequent starts can skip initdb. Persistence is gated on the
+// essential cluster files being present in the VFS rather than initdb's exit
+// code (initdb exits 1 on the known collation import while still producing a
+// usable cluster).
+func runInitdbAndPersist(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte, persistDir string) {
+	if err := runInitdb(ctx, fs, initdbWasm, postgresWasm); err != nil {
+		fmt.Fprintf(os.Stderr, "initdb reported: %v (continuing if cluster looks valid)\n", err)
+	}
+	for _, f := range []string{"/PG_VERSION", "/global/pg_control"} {
+		if _, err := fs.Stat(dataDir + f); err != nil {
+			fmt.Fprintf(os.Stderr, "not persisting: cluster incomplete (missing %s)\n", f)
+			return
+		}
+	}
+	if err := fs.SaveSubtree(dataDir, persistDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: failed to persist data dir to %s: %v\n", persistDir, err)
+	} else {
+		fmt.Printf("Persisted data dir to %s\n", persistDir)
+	}
 }
 
 // runCmd runs a postgres subcommand in a fresh wasmtime instance, reusing the

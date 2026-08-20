@@ -472,6 +472,17 @@ we recompile transparently). Warm runs deserialize instead of recompiling:
 Both runtimes now cache compiled native code to disk. Warm end-to-end: **wasmtime 1.49s
 vs wazero ~1.8s** (the wazero figure now includes the mmap allocator).
 
+**VFS persistence on the primary path.** `cmd/pglite` also gained the
+`SaveSubtree`/`LoadSubtree` skip-initdb logic (persist by cluster validity, not
+initdb's exit code). Combined with the `.cwasm` cache, the fully-warm "open existing
+DB + query" path is now:
+
+| `cmd/pglite` (wasmtime) | total |
+|-------------------------|-------|
+| cold (initdb + persist) | 2.66s |
+| warm, `.cwasm` but re-initdb | 1.49s |
+| **fully warm (`.cwasm` + skip initdb)** | **0.20s** |
+
 ## Timeline
 
 | Milestone | Status |
