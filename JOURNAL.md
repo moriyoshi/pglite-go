@@ -369,6 +369,36 @@ Key findings:
   (`__heap_base`), `wasi_snapshot_preview1`:13 funcs. Of the env funcs, ~87 are
   `__syscall_*`, ~60 are `invoke_*` trampolines, the rest Emscripten runtime.
 
+### wasmedge execution port — feasibility proven (raw CGo)
+
+Extending the execution comparison to wasmedge hit a toolchain wall, then a path
+around it:
+
+- The maintained Go binding (`second-state/WasmEdge-go`) tops out at **v0.14.0** and
+  **does not compile against the installed libwasmedge 0.17.1** — the C API changed
+  `WasmEdge_Limit` (struct) into an opaque `WasmEdge_LimitContext*`. No 0.17-compatible
+  binding exists.
+- Downloading a matching 0.14.x lib requires WasmEdge's `curl | bash` installer, which
+  the sandbox blocks (external download+execute) — needs the user.
+- **Raw CGo against the installed 0.17.1 C API works.** `cmd/probe-wasmedge`
+  (`//go:build wasmedge`) wires all imports — **130 func + 1 mem + 1 table + 4 global
+  across 3 host modules** — by reusing each import's declared type from the parsed AST,
+  then `WasmEdge_ExecutorInstantiate` succeeds. This is the wasmedge analog of
+  `cmd/probe-wasmtime` and de-risks the full port on a version-consistent lib (same
+  0.17.1 used for the AOT compile benchmark), no downgrade needed.
+
+Remaining for a full wasmedge execution port (~large, CGo): a single C host-func
+trampoline dispatching by index into the reused wazero Go closures; guest memory via
+`WasmEdge_CallingFrameGetMemoryInstance` + `MemoryInstanceGetPointer`; invoke_/longjmp;
+the initdb bridge; and calling `__main_argc_argv`. Its LLVM-AOT execution is expected to
+be the fastest of the three once wired.
+
+Build/run the probe:
+
+	CGO_ENABLED=1 CGO_CFLAGS="-I/usr/local/include" \
+	  CGO_LDFLAGS="-L/usr/local/lib -lwasmedge" DYLD_LIBRARY_PATH=/usr/local/lib \
+	  go run -tags wasmedge ./cmd/probe-wasmedge wasm/pglite.wasm
+
 **Execution port status:** PostgreSQL **runs on wasmtime** — `postgres -V` prints
 "PostgreSQL 17.5" and exits 0 (see `emscripten/wasmtime_port.go`,
 `cmd/pglite-wasmtime`, behind `//go:build wasmtime`; run
@@ -446,6 +476,8 @@ vs wazero ~1.8s** (the wazero figure now includes the mmap allocator).
 | VFS persistence + skip-initdb on restart | Done (2.3s restart vs 8.6s first run) |
 | wasmtime compile + instantiate benchmark | Done (1.43s compile, 0.002s instantiate) |
 | wasmedge AOT compile benchmark | Done (218s LLVM-O2, 20.6MB .so) |
+| wasmedge instantiation probe (raw CGo, 0.17.1) | Done (binding incompatible; C API works) |
+| wasmedge full execution port | Not started (feasibility proven; large CGo effort) |
 | wasmtime execution port: postgres -V runs | Done (1.5s compile+instantiate+run) |
 | wasmtime full initdb + SELECT 1+1 | Done (2.93s total vs wazero ~11s) |
 | Wire protocol (pgl_set_rw_cbs) | Not started |
