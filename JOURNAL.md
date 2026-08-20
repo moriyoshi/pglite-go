@@ -411,7 +411,19 @@ cut the wasmtime total from 7.46s to 2.93s. **wasmtime executes the initdb+query
 ~6–7× faster than wazero** (Cranelift native code vs wazero's), confirming the
 prediction that execution speed inverts the compile-time ranking. Net: wasmtime is
 faster on *both* axes here — ~70× faster cold compile and several× faster execution.
-A wasmtime compile cache (not yet added) would drop its total to ~1.6s.
+
+**wasmtime compile cache (added).** `compileCached` serializes the compiled module to
+`~/Library/Caches/pglite-go/wasmtime/*.cwasm` (keyed by wasm content hash; wasmtime's
+blob self-validates runtime version + host CPU, so a stale/foreign blob is rejected and
+we recompile transparently). Warm runs deserialize instead of recompiling:
+
+| wasmtime run | compile | total |
+|--------------|---------|-------|
+| cold (populate cache) | 1.43s | 2.90s |
+| warm (load `.cwasm`) | **0.03s** | **1.49s** |
+
+Both runtimes now cache compiled native code to disk. Warm end-to-end: **wasmtime 1.49s
+vs wazero ~1.8s** (the wazero figure now includes the mmap allocator).
 
 ## Timeline
 

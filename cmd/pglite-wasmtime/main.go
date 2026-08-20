@@ -9,8 +9,11 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -52,11 +55,16 @@ func main() {
 	total := time.Now()
 	comp := time.Now()
 	var cerr error
-	if postgresMod, cerr = wasmtime.NewModule(engine, postgresWasm); cerr != nil {
+	var cached bool
+	if postgresMod, cached, cerr = compileCached(engine, postgresWasm, "pglite"); cerr != nil {
 		fmt.Fprintf(os.Stderr, "compile pglite.wasm: %v\n", cerr)
 		os.Exit(1)
 	}
-	fmt.Printf("[wasmtime] compiled pglite.wasm once in %.2fs (reused across subcommands)\n", time.Since(comp).Seconds())
+	how := "compiled"
+	if cached {
+		how = "loaded from cache"
+	}
+	fmt.Printf("[wasmtime] %s pglite.wasm in %.2fs (reused across subcommands)\n", how, time.Since(comp).Seconds())
 
 	fmt.Println("=== Phase 1: initdb (on wasmtime) ===")
 	if err := runInitdb(ctx, fs, initdbWasm, postgresWasm); err != nil {
@@ -246,6 +254,40 @@ func runInitdb(ctx context.Context, fs *vfs.FS, initdbWasm, postgresWasm []byte)
 	}
 	fmt.Printf("initdb exit: %d\n", code)
 	return nil
+}
+
+// compileCached compiles wasm to a wasmtime.Module, persisting the serialized
+// native code to disk so subsequent runs deserialize (fast) instead of
+// recompiling. The cache key includes the wasm content hash; wasmtime's blob
+// additionally self-validates the runtime version + host CPU, so a stale/foreign
+// blob is rejected and we transparently recompile. Returns (module, fromCache).
+func compileCached(engine *wasmtime.Engine, wasm []byte, name string) (*wasmtime.Module, bool, error) {
+	dir := ""
+	if d, err := os.UserCacheDir(); err == nil {
+		dir = filepath.Join(d, "pglite-go", "wasmtime")
+	}
+	sum := sha256.Sum256(wasm)
+	path := ""
+	if dir != "" {
+		path = filepath.Join(dir, fmt.Sprintf("%s-%s.cwasm", name, hex.EncodeToString(sum[:8])))
+		if mod, err := wasmtime.NewModuleDeserializeFile(engine, path); err == nil {
+			return mod, true, nil
+		}
+	}
+	mod, err := wasmtime.NewModule(engine, wasm)
+	if err != nil {
+		return nil, false, err
+	}
+	if path != "" {
+		if blob, serr := mod.Serialize(); serr == nil {
+			_ = os.MkdirAll(dir, 0o755)
+			tmp := path + ".tmp"
+			if os.WriteFile(tmp, blob, 0o644) == nil {
+				_ = os.Rename(tmp, path) // atomic publish
+			}
+		}
+	}
+	return mod, false, nil
 }
 
 func mustRead(fs *vfs.FS, path string) []byte {
