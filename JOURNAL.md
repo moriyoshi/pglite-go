@@ -578,6 +578,25 @@ persistent backend. Verified via `cmd/wire-probe` and the `pgdriver` tests (`-ra
 CRUD, `UPDATE`→RowsAffected=2, params, NULL, Begin/Commit/Rollback. Remaining niceties
 (not blocking): binary result formats and COPY.
 
+**Latency vs the single-user path (ephemeral, warm, 500 iters, µs/query; same
+machine/harness against commit 179c54d):**
+
+| query | single-user (debugtup text) | wire | speedup |
+|-------|-----------------------------|------|---------|
+| `SELECT 1+1` | 218 | 153 | 1.4× |
+| `SELECT` 10-row table | 613 | 322 | **1.9×** |
+| `INSERT` one row | 165 | 144 | 1.1× |
+| `SELECT count(*)` | 293 | 263 | 1.1× |
+
+Both are the same persistent-backend model, so the delta is purely mechanism: the
+single-user path does a goroutine channel handoff and parses the verbose `debugtup`
+text (one line per attribute per row with typeid metadata), while wire pumps
+`PostgresMainLoopOnce` directly and decodes compact binary framing. The win scales
+with rows returned (1.9× on the 10-row SELECT), and is marginal for writes/scalars
+where backend execution dominates. (Both are ~1000× faster than the original
+fresh-`postgres --single`-per-query driver, which was ~200 ms/query.) Numbers are
+µs-scale and noisy run-to-run, but the direction is consistent.
+
 ## Timeline
 
 | Milestone | Status |
