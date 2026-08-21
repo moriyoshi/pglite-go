@@ -69,10 +69,12 @@ func New() *FS {
 }
 
 // ManifestEntry describes a file in the Emscripten preloaded data bundle.
+// Offsets are float64 because the file_packager manifest can render them either
+// as integers (204) or as floats (5093000.0).
 type ManifestEntry struct {
-	Filename string `json:"filename"`
-	Start    int    `json:"start"`
-	End      int    `json:"end"`
+	Filename string  `json:"filename"`
+	Start    float64 `json:"start"`
+	End      float64 `json:"end"`
 }
 
 // LoadManifest loads files from an Emscripten .data bundle using a manifest.
@@ -92,11 +94,12 @@ func (fs *FS) LoadManifest(manifestPath, dataPath string) error {
 	}
 
 	for _, entry := range entries {
-		if entry.Start > len(dataBytes) || entry.End > len(dataBytes) {
-			return fmt.Errorf("entry %s out of bounds [%d:%d] in %d bytes", entry.Filename, entry.Start, entry.End, len(dataBytes))
+		start, end := int(entry.Start), int(entry.End)
+		if start < 0 || end > len(dataBytes) || start > end {
+			return fmt.Errorf("entry %s out of bounds [%d:%d] in %d bytes", entry.Filename, start, end, len(dataBytes))
 		}
-		data := make([]byte, entry.End-entry.Start)
-		copy(data, dataBytes[entry.Start:entry.End])
+		data := make([]byte, end-start)
+		copy(data, dataBytes[start:end])
 
 		// Set executable permission for files in bin/ and .so files
 		mode := uint32(0o644)

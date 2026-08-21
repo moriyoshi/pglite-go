@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"strconv"
 	"strings"
 
@@ -143,17 +144,33 @@ func (w *wireConn) simpleQuery(sql string) (*Rows, error) {
 // (Parse/Bind/Describe/Execute/Sync), giving real server-side prepared
 // statements. Params are sent in text format; the server infers their types.
 func (w *wireConn) extendedQuery(sql string, params []string, isNull []bool) (*Rows, error) {
-	var msg []byte
-	msg = append(msg, parseMessage(sql)...)
-	msg = append(msg, bindMessage(params, isNull)...)
-	msg = append(msg, describePortalMessage()...)
-	msg = append(msg, executeMessage()...)
-	msg = append(msg, syncMessage()...)
-	out, err := w.exec(msg)
+	// Pump 1: Parse + Describe the statement to learn its result column OIDs, so
+	// we can request binary format for the columns we can decode. The unnamed
+	// statement survives the Sync and is reused by the Bind below.
+	var m1 []byte
+	m1 = append(m1, parseMessage(sql)...)
+	m1 = append(m1, describeStatementMessage()...)
+	m1 = append(m1, syncMessage()...)
+	d1, err := w.exec(m1)
 	if err != nil {
 		return nil, err
 	}
-	return w.parse(out)
+	oids, errText := describeResultOIDs(d1)
+	if errText != "" {
+		return nil, fmt.Errorf("%s", errText)
+	}
+
+	// Pump 2: Bind (requesting per-column result formats) + Execute.
+	var m2 []byte
+	m2 = append(m2, bindMessage(params, isNull, resultFormats(oids))...)
+	m2 = append(m2, describePortalMessage()...)
+	m2 = append(m2, executeMessage()...)
+	m2 = append(m2, syncMessage()...)
+	d2, err := w.exec(m2)
+	if err != nil {
+		return nil, err
+	}
+	return w.parse(d2)
 }
 
 func (w *wireConn) close() {
@@ -185,7 +202,7 @@ func parseMessage(sql string) []byte {
 	return frame('P', b)
 }
 
-func bindMessage(params []string, isNull []bool) []byte {
+func bindMessage(params []string, isNull []bool, formats []int16) []byte {
 	var b []byte
 	b = append(b, 0)                        // unnamed portal
 	b = append(b, 0)                        // unnamed statement
@@ -199,11 +216,60 @@ func bindMessage(params []string, isNull []bool) []byte {
 		b = binary.BigEndian.AppendUint32(b, uint32(len(p)))
 		b = append(b, p...)
 	}
-	b = binary.BigEndian.AppendUint16(b, 0) // 0 result format codes => all text
+	// Per-column result format codes (0 text, 1 binary).
+	b = binary.BigEndian.AppendUint16(b, uint16(len(formats)))
+	for _, f := range formats {
+		b = binary.BigEndian.AppendUint16(b, uint16(f))
+	}
 	return frame('B', b)
 }
 
-func describePortalMessage() []byte { return frame('D', append([]byte{'P'}, 0)) }
+// binaryOID lists the type OIDs we request in binary format and can decode
+// losslessly. Everything else stays text (and is returned as a string unless
+// decodeText knows a typed form).
+var binaryOID = map[uint32]bool{
+	16: true, // bool
+	17: true, // bytea
+	20: true, // int8
+	21: true, // int2
+	23: true, // int4
+	26: true, // oid
+	700: true, // float4
+	701: true, // float8
+}
+
+func resultFormats(oids []uint32) []int16 {
+	f := make([]int16, len(oids))
+	for i, oid := range oids {
+		if binaryOID[oid] {
+			f[i] = 1
+		}
+	}
+	return f
+}
+
+func describeStatementMessage() []byte { return frame('D', append([]byte{'S'}, 0)) }
+func describePortalMessage() []byte    { return frame('D', append([]byte{'P'}, 0)) }
+
+// describeResultOIDs extracts result column OIDs from a Parse+Describe response.
+func describeResultOIDs(buf []byte) (oids []uint32, errText string) {
+	for len(buf) >= 5 {
+		typ := buf[0]
+		n := binary.BigEndian.Uint32(buf[1:5])
+		if int(n)+1 > len(buf) {
+			break
+		}
+		payload := buf[5 : 1+n]
+		switch typ {
+		case 'T':
+			_, oids, _ = decodeRowDesc(payload)
+		case 'E':
+			errText = decodeError(payload)
+		}
+		buf = buf[1+n:]
+	}
+	return
+}
 func executeMessage() []byte        { return frame('E', append([]byte{0}, 0, 0, 0, 0)) } // portal="", maxRows=0
 func syncMessage() []byte           { return frame('S', nil) }
 
@@ -219,6 +285,8 @@ func frame(typ byte, payload []byte) []byte {
 func (w *wireConn) parse(buf []byte) (*Rows, error) {
 	r := &Rows{}
 	var perr string
+	var oids []uint32
+	var formats []int16
 	for len(buf) >= 5 {
 		typ := buf[0]
 		n := binary.BigEndian.Uint32(buf[1:5])
@@ -228,9 +296,10 @@ func (w *wireConn) parse(buf []byte) (*Rows, error) {
 		payload := buf[5 : 1+n]
 		switch typ {
 		case 'T': // RowDescription
-			r.Columns, r.TypeOIDs = decodeRowDesc(payload)
+			r.Columns, oids, formats = decodeRowDesc(payload)
+			r.TypeOIDs = oids
 		case 'D': // DataRow
-			r.Rows = append(r.Rows, decodeDataRow(payload))
+			r.Rows = append(r.Rows, decodeDataRow(payload, oids, formats))
 		case 'C': // CommandComplete
 			tag := strings.TrimRight(string(payload), "\x00")
 			r.Command = tag
@@ -250,35 +319,137 @@ func (w *wireConn) parse(buf []byte) (*Rows, error) {
 	return r, nil
 }
 
-func decodeRowDesc(p []byte) (names []string, oids []uint32) {
+func decodeRowDesc(p []byte) (names []string, oids []uint32, formats []int16) {
 	num := int(binary.BigEndian.Uint16(p))
 	p = p[2:]
 	for i := 0; i < num; i++ {
 		z := indexZero(p)
 		names = append(names, string(p[:z]))
 		p = p[z+1:]
-		oids = append(oids, binary.BigEndian.Uint32(p[6:10])) // after tableOID(4)+colNo(2)
-		p = p[18:]                                            // tableOID4 colNo2 typeOID4 typLen2 typMod4 fmt2
+		// tableOID(4) colNo(2) typeOID(4) typLen(2) typMod(4) format(2)
+		oids = append(oids, binary.BigEndian.Uint32(p[6:10]))
+		formats = append(formats, int16(binary.BigEndian.Uint16(p[16:18])))
+		p = p[18:]
 	}
 	return
 }
 
-func decodeDataRow(p []byte) []*string {
+func decodeDataRow(p []byte, oids []uint32, formats []int16) []any {
 	num := int(binary.BigEndian.Uint16(p))
 	p = p[2:]
-	row := make([]*string, 0, num)
+	row := make([]any, num)
 	for i := 0; i < num; i++ {
 		l := int32(binary.BigEndian.Uint32(p))
 		p = p[4:]
 		if l < 0 {
-			row = append(row, nil) // NULL
+			row[i] = nil // NULL
 			continue
 		}
-		s := string(p[:l])
-		row = append(row, &s)
+		raw := p[:l]
 		p = p[l:]
+		var oid uint32
+		if i < len(oids) {
+			oid = oids[i]
+		}
+		if i < len(formats) && formats[i] == 1 {
+			row[i] = decodeBinary(oid, raw)
+		} else {
+			row[i] = decodeText(oid, raw)
+		}
 	}
 	return row
+}
+
+// decodeText decodes a text-format value to a typed Go value where the OID is
+// known, else returns it as a string.
+func decodeText(oid uint32, raw []byte) any {
+	s := string(raw)
+	switch oid {
+	case 16: // bool
+		return s == "t" || s == "true"
+	case 20, 21, 23, 26: // int8/int2/int4/oid
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return v
+		}
+	case 700, 701: // float4/float8
+		if v, err := strconv.ParseFloat(s, 64); err == nil {
+			return v
+		}
+	case 17: // bytea, rendered as \x hex
+		if b, ok := decodeByteaText(s); ok {
+			return b
+		}
+	}
+	return s
+}
+
+// decodeBinary decodes a binary-format value (only OIDs in binaryOID reach here).
+func decodeBinary(oid uint32, raw []byte) any {
+	switch oid {
+	case 16: // bool
+		return len(raw) > 0 && raw[0] != 0
+	case 21: // int2
+		if len(raw) == 2 {
+			return int64(int16(binary.BigEndian.Uint16(raw)))
+		}
+	case 23: // int4
+		if len(raw) == 4 {
+			return int64(int32(binary.BigEndian.Uint32(raw)))
+		}
+	case 20: // int8
+		if len(raw) == 8 {
+			return int64(binary.BigEndian.Uint64(raw))
+		}
+	case 26: // oid (unsigned 32)
+		if len(raw) == 4 {
+			return int64(binary.BigEndian.Uint32(raw))
+		}
+	case 700: // float4
+		if len(raw) == 4 {
+			return float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))
+		}
+	case 701: // float8
+		if len(raw) == 8 {
+			return math.Float64frombits(binary.BigEndian.Uint64(raw))
+		}
+	case 17: // bytea
+		b := make([]byte, len(raw))
+		copy(b, raw)
+		return b
+	}
+	return string(raw)
+}
+
+func decodeByteaText(s string) ([]byte, bool) {
+	if !strings.HasPrefix(s, `\x`) {
+		return nil, false
+	}
+	h := s[2:]
+	if len(h)%2 != 0 {
+		return nil, false
+	}
+	b := make([]byte, len(h)/2)
+	for i := range b {
+		hi, ok1 := hexVal(h[2*i])
+		lo, ok2 := hexVal(h[2*i+1])
+		if !ok1 || !ok2 {
+			return nil, false
+		}
+		b[i] = hi<<4 | lo
+	}
+	return b, true
+}
+
+func hexVal(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }
 
 func decodeError(p []byte) string {

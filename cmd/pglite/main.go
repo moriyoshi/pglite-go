@@ -44,7 +44,7 @@ func main() {
 			if v == nil {
 				cells[i] = "NULL"
 			} else {
-				cells[i] = *v
+				cells[i] = fmt.Sprint(v)
 			}
 		}
 		fmt.Println(strings.Join(cells, " | "))

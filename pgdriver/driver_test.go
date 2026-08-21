@@ -95,6 +95,45 @@ func TestDriverCRUD(t *testing.T) {
 	}
 }
 
+// TestBinaryResultFormats checks that parameterized queries (extended protocol)
+// decode binary-format values into the right Go types across int/float/bool/bytea.
+func TestBinaryResultFormats(t *testing.T) {
+	db, err := sql.Open("pglite", "dir="+wasmDir(t)+" ephemeral=true")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+
+	// $1 forces the extended protocol (binary result formats).
+	var (
+		i2  int16
+		i4  int32
+		i8  int64
+		f4  float32
+		f8  float64
+		b   bool
+		raw []byte
+	)
+	row := db.QueryRow(`SELECT 32000::int2, 70000::int4, 5000000000::int8,
+		1.5::float4, 2.25::float8, true, '\xdeadbeef'::bytea WHERE $1`, true)
+	if err := row.Scan(&i2, &i4, &i8, &f4, &f8, &b, &raw); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	if i2 != 32000 || i4 != 70000 || i8 != 5000000000 {
+		t.Errorf("ints = %d,%d,%d", i2, i4, i8)
+	}
+	if f4 != 1.5 || f8 != 2.25 {
+		t.Errorf("floats = %v,%v", f4, f8)
+	}
+	if !b {
+		t.Errorf("bool = %v", b)
+	}
+	if string(raw) != "\xde\xad\xbe\xef" {
+		t.Errorf("bytea = % x, want de ad be ef", raw)
+	}
+}
+
 // TestDriverTransaction verifies real transactions on the persistent backend:
 // commit persists, rollback discards.
 func TestDriverTransaction(t *testing.T) {

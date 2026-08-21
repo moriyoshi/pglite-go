@@ -5,11 +5,16 @@ package pglite
 // Rows is the structured result of a query, decoded from the PostgreSQL wire
 // protocol.
 type Rows struct {
-	Columns      []string    // column names, in order
-	TypeOIDs     []uint32    // PostgreSQL type OID per column
-	Rows         [][]*string // row-major text values; nil element = SQL NULL
-	Command      string      // CommandComplete tag, e.g. "INSERT 0 1", "SELECT 3"
-	AffectedRows int64       // rows affected/returned, parsed from Command
+	Columns  []string // column names, in order
+	TypeOIDs []uint32 // PostgreSQL type OID per column
+	// Rows is row-major, one []any per row. Each value is a decoded Go value —
+	// int64, float64, bool, []byte, string, or nil (SQL NULL) — chosen by the
+	// column's type OID. Common numeric/bool/bytea types are received in binary
+	// format (extended-protocol queries); everything else arrives as text and is
+	// returned as a string.
+	Rows         [][]any
+	Command      string // CommandComplete tag, e.g. "INSERT 0 1", "SELECT 3"
+	AffectedRows int64  // rows affected/returned, parsed from Command
 }
 
 // Query runs sql via the simple query protocol on the persistent backend and

@@ -577,7 +577,19 @@ for `$N` params — real server-side prepared statements, no client-side interpo
 tags, server-side prepared statements, transactions, temp tables/SET, all on one
 persistent backend. Verified via `cmd/wire-probe` and the `pgdriver` tests (`-race`):
 CRUD, `UPDATE`→RowsAffected=2, params, NULL, Begin/Commit/Rollback. Remaining niceties
-(not blocking): binary result formats and COPY.
+(not blocking): COPY, LISTEN/NOTIFY.
+
+**Binary result formats (added).** Parameterized (extended-protocol) queries request
+**binary** result format for the OIDs we can decode losslessly (int2/4/8, oid, float4/8,
+bool, bytea), text for the rest. Since the format must be chosen *before* the
+RowDescription is known, `extendedQuery` runs two pumps: Parse+Describe(statement)+Sync
+to learn the result OIDs, then Bind(per-column formats)+Execute+Sync. The wire layer now
+decodes each value to a typed Go value (`int64`/`float64`/`bool`/`[]byte`/`string`/nil)
+keyed by (OID, format) — so `Rows.Rows` is `[][]any` and the driver passes values
+straight through (no more text→type conversion). Plain `Query` stays on the text simple
+protocol (also typed-decoded). Verified by `TestBinaryResultFormats` (int2/4/8, float4/8,
+bool, bytea → exact Go types). Also made the VFS manifest loader tolerant of float
+offsets (a refreshed `pglite.data` manifest renders them as `5093000.0`).
 
 **Latency vs the single-user path (ephemeral, warm, 500 iters, µs/query; same
 machine/harness against commit 179c54d):**

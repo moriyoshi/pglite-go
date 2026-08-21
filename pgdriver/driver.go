@@ -184,64 +184,15 @@ func (rs *rows) Next(dest []driver.Value) error {
 	row := rs.r.Rows[rs.pos]
 	rs.pos++
 	for i := range dest {
-		if i >= len(row) || row[i] == nil {
+		// The library already decodes each value to a typed Go value
+		// (int64/float64/bool/[]byte/string/nil) — all valid driver.Values.
+		if i < len(row) {
+			dest[i] = row[i]
+		} else {
 			dest[i] = nil
-			continue
 		}
-		dest[i] = convert(rs.r.TypeOIDs[i], *row[i])
 	}
 	return nil
-}
-
-// convert maps a text value + type OID to a database/sql driver.Value.
-func convert(oid uint32, s string) driver.Value {
-	switch oid {
-	case 21, 23, 20, 26: // int2, int4, int8, oid
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return v
-		}
-	case 700, 701: // float4, float8
-		if v, err := strconv.ParseFloat(s, 64); err == nil {
-			return v
-		}
-	case 16: // bool
-		return s == "t" || s == "true"
-	case 17: // bytea (rendered as \x hex)
-		if strings.HasPrefix(s, `\x`) {
-			if b, err := hexDecode(s[2:]); err == nil {
-				return b
-			}
-		}
-	}
-	return s // text and everything else as a string; Scan converts as needed
-}
-
-func hexDecode(s string) ([]byte, error) {
-	if len(s)%2 != 0 {
-		return nil, fmt.Errorf("odd hex length")
-	}
-	b := make([]byte, len(s)/2)
-	for i := 0; i < len(b); i++ {
-		hi, err1 := hexNibble(s[2*i])
-		lo, err2 := hexNibble(s[2*i+1])
-		if err1 != nil || err2 != nil {
-			return nil, fmt.Errorf("bad hex")
-		}
-		b[i] = hi<<4 | lo
-	}
-	return b, nil
-}
-
-func hexNibble(c byte) (byte, error) {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0', nil
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10, nil
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10, nil
-	}
-	return 0, fmt.Errorf("bad nibble")
 }
 
 // encodeParams renders bind arguments (ordered by $N) as their PostgreSQL text

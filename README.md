@@ -41,11 +41,12 @@ history (runtime benchmarks, the wire-protocol reverse-engineering, perf work).
 - The PGlite **wasm assets**. Fetch them once:
 
   ```sh
-  ./scripts/download-wasm.sh      # downloads @electric-sql/pglite@0.4.2 -> ./wasm
+  ./scripts/update-wasm.sh        # downloads @electric-sql/pglite@0.4.2 -> ./wasm
   ```
 
   This writes `pglite.wasm`, `initdb.wasm`, `pglite.manifest.json`, and `pglite.data`
-  into `wasm/`. Point the driver/library at that directory.
+  into `wasm/` (set `PGLITE_VERSION` to pin a different release). Point the
+  driver/library at that directory.
 
 ## Usage
 
@@ -86,7 +87,7 @@ db, _ := pglite.Open(pglite.Config{WasmDir: "wasm"})
 defer db.Close()
 
 rows, _ := db.Query("SELECT 1 + 1 AS n, 'hi'::text AS s")
-// rows.Columns, rows.TypeOIDs, rows.Rows ([][]*string), rows.AffectedRows
+// rows.Columns, rows.TypeOIDs, rows.Rows ([][]any of typed Go values), rows.AffectedRows
 
 // Server-side prepared statement (extended protocol):
 rows, _ = db.QueryParams("SELECT $1::int + $2::int", []string{"2", "3"}, []bool{false, false})
@@ -118,8 +119,10 @@ On an idle x86-64 Mac (see `JOURNAL.md` for methodology):
 
 - **Single connection.** The embedded backend is one connection (as in PGlite); use
   `db.SetMaxOpenConns(1)`. The library serializes internally.
-- **Text result values.** Rows are decoded from their text encodings (no binary
-  result format yet). `database/sql`'s `Scan` converts them to Go types as usual.
+- **Result types.** Common numeric/bool/bytea columns are received in binary format
+  and decoded to typed Go values (`int64`, `float64`, `bool`, `[]byte`); other types
+  arrive as text strings, which `Scan` converts as usual. Binary applies to
+  parameterized (extended-protocol) queries; plain `Query` uses the text protocol.
 - **No `COPY` / `LISTEN`/`NOTIFY` yet.**
 - **CGo required.** The wire-protocol library runs on wasmtime (CGo). A pure-Go
   `-tags wazero` build exists (`cmd/pglite-poc`) but uses an older single-user query
@@ -133,7 +136,7 @@ pgdriver/             database/sql driver, registered as "pglite"
 emscripten/           Emscripten + WASI host layer (wasmtime backend, syscalls, wire hooks)
 vfs/                  in-memory virtual filesystem
 cmd/pglite/           demo using the library
-scripts/download-wasm.sh   fetches the PGlite wasm assets
+scripts/update-wasm.sh     fetches/refreshes the vendored PGlite wasm assets
 ```
 
 ## Credits
