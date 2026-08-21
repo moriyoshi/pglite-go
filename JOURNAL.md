@@ -514,9 +514,10 @@ Turned the demo into a reusable library plus a `database/sql` driver.
   pairs (`dir=`, `database=`, `persist=`, `ephemeral=`). `cmd/pglite` is now a thin
   consumer of the library.
 
-**Persistent single-user session (the parity leap).** Instead of spawning a
-`postgres --single` backend per query, a `DB` starts **one** backend and keeps it
-alive, parked between statements in a blocking, channel-fed stdin (`session.go`).
+**Persistent single-user session (the parity leap).** _[Historical — superseded by
+the wire protocol below; `session.go` and its streaming stdin were removed.]_ Instead
+of spawning a `postgres --single` backend per query, a `DB` starts **one** backend and
+keeps it alive, parked between statements in a blocking, channel-fed stdin (`session.go`).
 So session state — the open transaction, temp tables, `SET`, prepared statements —
 survives across calls: **BEGIN in one `Query` and COMMIT in a later one form a real
 transaction.** Verified: cross-call BEGIN/INSERT/INSERT → count 3, ROLLBACK → 1,
@@ -596,6 +597,16 @@ with rows returned (1.9× on the 10-row SELECT), and is marginal for writes/scal
 where backend execution dominates. (Both are ~1000× faster than the original
 fresh-`postgres --single`-per-query driver, which was ~200 ms/query.) Numbers are
 µs-scale and noisy run-to-run, but the direction is consistent.
+
+**Wire is now the sole query path** (the two single-user sections above are history).
+The `postgres --single` query mechanism (feed SQL to stdin, parse `debugtup`) and its
+supporting streaming-stdin plumbing (`wasiImpl.stdinReader`, the blocking `fd_read`
+branch, `WTRuntime.SetStdinReader`) were removed once wire landed. What still uses
+`--single`: PGlite starts the wire backend in single mode and drives it over
+`pgl_set_rw_cbs` (a launch flag, not a query path); and initdb's `--boot`/`--single`
+subcommands, which are fed bootstrap SQL via the surviving byte-slice `stdinData`
+path. Also, initdb's own stdout/stderr are now routed to `io.Discard`, so the library
+is fully quiet (an ephemeral, full-initdb run emits only the caller's output).
 
 ## Timeline
 
