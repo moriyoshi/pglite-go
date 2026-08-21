@@ -714,6 +714,16 @@ func newWASIImpl(fs *vfs.FS, stdinData []byte, stdoutCapture *[]byte) *wasiImpl 
 // SetStdoutCapture toggles dynamic stdout capture on the running instance.
 func (rt *WTRuntime) SetStdoutCapture(buf *[]byte) { rt.wasi.StdoutOverride = buf }
 
+// SetStdinReader backs fd 0 with a streaming reader (whose Read may block),
+// keeping a single-user backend parked between statements. Set before CallMain.
+func (rt *WTRuntime) SetStdinReader(r io.Reader) { rt.wasi.stdinReader = r }
+
+// SetStdout redirects fd 1 to w. Set before CallMain.
+func (rt *WTRuntime) SetStdout(w io.Writer) { rt.wasi.stdout = w }
+
+// SetStderr redirects fd 2 to w. Set before CallMain.
+func (rt *WTRuntime) SetStderr(w io.Writer) { rt.wasi.stderr = w }
+
 // goModuleFuncs returns the 13 WASI functions by import name.
 func (w *wasiImpl) goModuleFuncs() map[string]api.GoModuleFunc {
 	return map[string]api.GoModuleFunc{

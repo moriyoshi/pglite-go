@@ -5,7 +5,6 @@ package pglite
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -20,52 +19,42 @@ type Rows struct {
 	Command  string    // last command tag if reported (e.g. "INSERT 0 1")
 }
 
-// Raw runs sql in a single-user backend and returns the raw backend stdout.
-// Exposed for debugging/calibration of the result parser.
+// Raw sends sql to the persistent backend and returns its raw stdout. Exposed
+// for debugging/calibration of the result parser.
 func (db *DB) Raw(sql string) ([]byte, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.rawLocked(sql)
+	out, _, err := db.sess.exec(sql)
+	return out, err
 }
 
-func (db *DB) rawLocked(sql string) ([]byte, error) {
-	if !strings.HasSuffix(sql, "\n") {
-		sql += "\n"
-	}
-	args := []string{"/pglite/bin/postgres", "--single", "-D", dataDir, db.database}
-	var out []byte
-	code, err := db.runCmd(context.Background(), args, []byte(sql), &out)
-	if err != nil {
-		return out, err
-	}
-	if code != 0 {
-		return out, fmt.Errorf("backend exited %d", code)
-	}
-	return out, nil
-}
-
-// Query runs a statement and returns its rows. For statements that return no
-// rows (INSERT/UPDATE/DDL) the result has zero rows; use Exec if you only need
-// success.
+// Query runs sql on the persistent backend and returns its rows. Session state
+// (open transactions, temp tables, SET) persists across calls, so BEGIN in one
+// Query and COMMIT in a later one form a single transaction.
 func (db *DB) Query(sql string) (*Rows, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	out, err := db.rawLocked(sql)
-	if perr := parseError(out); perr != "" {
-		return nil, fmt.Errorf("%s", perr)
-	}
+	return db.queryLocked(sql)
+}
+
+func (db *DB) queryLocked(sql string) (*Rows, error) {
+	out, errText, err := db.sess.exec(sql)
 	if err != nil {
 		return nil, err
 	}
-	rows := parseSingleUser(out)
-	if serr := db.syncLocked(); serr != nil {
-		return rows, serr
+	// PostgreSQL errors go to stderr in single-user mode; some also echo on
+	// stdout. Check both.
+	if perr := parseError([]byte(errText)); perr != "" {
+		return nil, fmt.Errorf("%s", perr)
 	}
-	return rows, nil
+	if perr := parseError(out); perr != "" {
+		return nil, fmt.Errorf("%s", perr)
+	}
+	return parseSingleUser(out), nil
 }
 
-// Exec runs a statement for its side effects and returns the command tag (if
-// the backend reported one; empty otherwise).
+// Exec runs sql for its side effects and returns the command tag if the backend
+// reported one (empty otherwise).
 func (db *DB) Exec(sql string) (string, error) {
 	r, err := db.Query(sql)
 	if err != nil {

@@ -84,3 +84,58 @@ func TestDriverCRUD(t *testing.T) {
 		t.Errorf("count(active) = %d, want 1", n)
 	}
 }
+
+// TestDriverTransaction verifies real transactions on the persistent backend:
+// commit persists, rollback discards.
+func TestDriverTransaction(t *testing.T) {
+	db, err := sql.Open("pglite", "dir="+wasmDir(t)+" ephemeral=true")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1) // single backend = single connection
+	defer db.Close()
+
+	if _, err := db.Exec("CREATE TABLE acct (id int, bal int)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO acct VALUES (1, 100)"); err != nil {
+		t.Fatal(err)
+	}
+
+	count := func() (n int) {
+		if err := db.QueryRow("SELECT bal FROM acct WHERE id = 1").Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+
+	// Rollback discards.
+	tx, err := db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec("UPDATE acct SET bal = 999 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if got := count(); got != 100 {
+		t.Errorf("after rollback bal = %d, want 100", got)
+	}
+
+	// Commit persists.
+	tx, err = db.Begin()
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec("UPDATE acct SET bal = 250 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if got := count(); got != 250 {
+		t.Errorf("after commit bal = %d, want 250", got)
+	}
+}

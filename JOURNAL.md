@@ -514,29 +514,42 @@ Turned the demo into a reusable library plus a `database/sql` driver.
   pairs (`dir=`, `database=`, `persist=`, `ephemeral=`). `cmd/pglite` is now a thin
   consumer of the library.
 
-**How a query runs (single-user backend).** Each `Query`/`Exec` runs a fresh
-`postgres --single` backend over the *shared* VFS cluster, so data written by one
-statement is visible to the next (CREATE→INSERT→SELECT across separate backend
-processes all hit the same on-disk catalog/heap files in the VFS). Results are
-parsed from the backend's `debugtup` output — a descriptor block (column names +
-type OIDs) then one `\t----`-delimited block per tuple, with **NULL attributes
-omitted**, so values are keyed by column index. The driver maps type OIDs to Go
-types (int2/4/8→int64, float4/8→float64, bool→bool, bytea→[]byte, else string) and
-interpolates `$N` bind params client-side with proper escaping. `jmoiron/sqlx`
-works unchanged (it wraps `database/sql`). Verified end-to-end (`pgdriver` test +
-sqlx StructScan/Get/parameterized WHERE, typed scans, NULL).
+**Persistent single-user session (the parity leap).** Instead of spawning a
+`postgres --single` backend per query, a `DB` starts **one** backend and keeps it
+alive, parked between statements in a blocking, channel-fed stdin (`session.go`).
+So session state — the open transaction, temp tables, `SET`, prepared statements —
+survives across calls: **BEGIN in one `Query` and COMMIT in a later one form a real
+transaction.** Verified: cross-call BEGIN/INSERT/INSERT → count 3, ROLLBACK → 1,
+COMMIT → 2, temp table visible across calls; driver `Begin`/`Commit`/`Rollback`
+tested under `-race`.
 
-**Limits (single-user v1):** each Query/Exec is autocommit — a transaction can't
-span calls (`Begin` is unsupported; wrap multiple statements in one `BEGIN; …;
-COMMIT;` call). Bind params are client-side interpolated, not server-side prepared.
-`RowsAffected` is 0 (the debug format emits no command tag). Values arrive as text.
+How the coordination works (no Asyncify needed): the backend runs `main()` on its
+own goroutine; **`fd_read` on stdin is the authoritative "previous statement
+finished" signal** (the backend only asks for input after flushing all output). So
+the streaming stdin `Read` (on the backend goroutine) hands the accumulated stdout
+to the caller via a channel, then blocks for the next statement. All stdout
+bookkeeping is backend-goroutine-local; cross-goroutine handoff is via channels.
+Gotcha that cost an hour: the guest passes **two iovecs with the first zero-length**
+to `fd_read` — the initial code returned early on the zero-length first iovec,
+signalling spurious EOF and making the backend shut down at startup; the fix
+iterates iovecs to the first with space.
 
-**Upgrade path:** the PGlite wire-protocol bridge (`pgl_set_rw_cbs`, exported by
-pglite.wasm) would give real sessions, server-side prepared statements, typed
-binary results, and RowsAffected. Note: no Asyncify in this build, so the backend
-can't suspend across host calls — the wire path is necessarily a per-batch model
-(startup + queries → captured responses per invocation); the exact
-startup/connect driving sequence needs PGlite's JS glue to reverse-engineer.
+The backend is a **single connection** (as in PGlite), so access is serialized
+(`DB` mutex; database/sql callers set `SetMaxOpenConns(1)`).
+
+**Result parsing.** From the backend's `debugtup` output — a descriptor block
+(column names + type OIDs) then one `\t----`-delimited block per tuple, with **NULL
+attributes omitted**, so values are keyed by column index. The driver maps type
+OIDs to Go types (int2/4/8→int64, float4/8→float64, bool→bool, bytea→[]byte, else
+string) and interpolates `$N` params client-side. `jmoiron/sqlx` works unchanged.
+
+**Remaining limits vs the wire protocol:** bind params are client-side interpolated
+(not server-side prepared), values arrive as text, and `RowsAffected`/command tags
+aren't reported (the debug format emits none). **Upgrade path:** the PGlite
+wire-protocol bridge (`pgl_set_rw_cbs`) for server-side prepared statements, typed
+binary results, and RowsAffected. Note: no Asyncify in this build, so a persistent
+*wire* session would use the same parked-on-stdin/read trick this session already
+proves out; the remaining unknown is the exact startup/connect message sequence.
 
 ## Timeline
 
@@ -565,6 +578,7 @@ startup/connect driving sequence needs PGlite's JS glue to reverse-engineer.
 | wasmtime full initdb + SELECT 1+1 | Done (2.93s total vs wazero ~11s) |
 | Library API (pglite package) | Done |
 | database/sql driver + sqlx | Done (typed rows, params, NULL) |
-| Wire protocol (pgl_set_rw_cbs) | Not started (single-user backend used for v1) |
+| Persistent session + real transactions | Done (cross-call BEGIN/COMMIT/ROLLBACK, -race clean) |
+| Wire protocol (pgl_set_rw_cbs) | Not started (upgrade for prepared stmts/binary/RowsAffected) |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |

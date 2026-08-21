@@ -4,17 +4,23 @@
 // to WebAssembly) on the wasmtime runtime, with a hand-written Emscripten/WASI
 // host layer and an in-memory VFS.
 //
-// A DB is a cluster: Open initializes (or loads a persisted) data directory and
-// keeps it in an in-memory filesystem. Each Exec/Query runs a fresh single-user
-// PostgreSQL backend against that shared filesystem, so data written by one
-// statement is visible to the next. For the standard Go database API, use the
-// registered "pglite" database/sql driver (see driver.go).
+// A DB is a cluster: Open initializes (or loads a persisted) data directory,
+// keeps it in an in-memory filesystem, and starts one persistent single-user
+// PostgreSQL backend. Exec/Query feed statements to that live backend, so
+// session state — the current transaction, temp tables, SET, prepared
+// statements — persists across calls: BEGIN in one Query and COMMIT in a later
+// one form a single transaction. For the standard Go database API, use the
+// registered "pglite" database/sql driver (package pgdriver).
 //
-// Limitations (v1, single-user backend): each Exec/Query is autocommit — a
-// transaction cannot span calls (wrap multiple statements in one call, e.g.
-// "BEGIN; ...; COMMIT;"). Bind parameters are interpolated client-side. The
-// planned upgrade is the PGlite wire-protocol bridge (pgl_set_rw_cbs) for real
-// sessions, server-side prepared statements, and typed binary results.
+// The backend is a single connection (as in PGlite itself), so concurrent use
+// must be serialized — the DB does this internally, and database/sql callers
+// should set db.SetMaxOpenConns(1).
+//
+// Current limits vs the PostgreSQL wire protocol: bind parameters are
+// interpolated client-side (via the driver), values arrive as text, and
+// RowsAffected/command tags are not reported by the single-user backend. The
+// planned upgrade is the PGlite wire-protocol bridge (pgl_set_rw_cbs) for
+// server-side prepared statements and typed binary results.
 package pglite
 
 import (
@@ -62,6 +68,7 @@ type DB struct {
 	fs          *vfs.FS
 	persistDir  string
 	database    string
+	sess        *session   // persistent single-user backend
 	mu          sync.Mutex // serializes backend invocations
 }
 
@@ -129,6 +136,14 @@ func Open(cfg Config) (*DB, error) {
 			return nil, err
 		}
 	}
+
+	// Start the persistent backend so session state (transactions, temp tables,
+	// SET, prepared statements) survives across queries.
+	sess, err := db.startSession()
+	if err != nil {
+		return nil, fmt.Errorf("start backend: %w", err)
+	}
+	db.sess = sess
 	return db, nil
 }
 
@@ -146,9 +161,16 @@ func (db *DB) syncLocked() error {
 	return db.fs.SaveSubtree(dataDir, db.persistDir)
 }
 
-// Close syncs the cluster to the host and releases resources.
+// Close ends the backend session, syncs the cluster to the host, and releases
+// resources.
 func (db *DB) Close() error {
-	err := db.Sync()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.sess != nil {
+		db.sess.close()
+		db.sess = nil
+	}
+	err := db.syncLocked()
 	if db.engine != nil {
 		db.engine.Close()
 	}

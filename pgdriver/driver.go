@@ -13,9 +13,11 @@
 //	persist=<path>    host dir to persist the cluster (default: user cache dir)
 //	ephemeral=true    keep the cluster only in memory
 //
-// Limitations (single-user backend): each Query/Exec is autocommit — a
-// transaction cannot span calls, so Begin is unsupported. Bind parameters ($1,
-// $2, …) are interpolated client-side with proper escaping.
+// The backend is a single, persistent connection, so real transactions work
+// (db.Begin/tx.Commit/tx.Rollback) — but callers must serialize access with
+// db.SetMaxOpenConns(1). Bind parameters ($1, $2, …) are interpolated
+// client-side with proper escaping; values arrive as text and RowsAffected is
+// not reported (single-user backend limitation).
 package pgdriver
 
 import (
@@ -90,9 +92,22 @@ func (c *conn) Prepare(query string) (driver.Stmt, error) {
 	return &stmt{c: c, query: query}, nil
 }
 func (c *conn) Close() error { return nil } // the shared cluster outlives the conn
+
+// Begin starts a transaction on the persistent backend session. Because the
+// backend is a single connection, callers must serialize access with
+// db.SetMaxOpenConns(1) (PGlite is likewise single-connection); otherwise a
+// concurrent statement could land inside another connection's transaction.
 func (c *conn) Begin() (driver.Tx, error) {
-	return nil, fmt.Errorf("pglite: transactions spanning statements are not supported (wrap in a single BEGIN; …; COMMIT; statement)")
+	if _, err := c.db.Exec("BEGIN"); err != nil {
+		return nil, err
+	}
+	return &tx{c: c}, nil
 }
+
+type tx struct{ c *conn }
+
+func (t *tx) Commit() error   { _, err := t.c.db.Exec("COMMIT"); return err }
+func (t *tx) Rollback() error { _, err := t.c.db.Exec("ROLLBACK"); return err }
 
 func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
 	q, err := interpolate(query, args)
