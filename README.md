@@ -2,7 +2,7 @@
 
 Embedded PostgreSQL for Go — no external server, no libpq, no separate process.
 
-It runs [PGlite](https://github.com/electric-sql/pglite) (real PostgreSQL 17.5
+It runs [PGlite](https://github.com/electric-sql/pglite) (real PostgreSQL 18
 compiled to WebAssembly) on the [wasmtime](https://github.com/bytecodealliance/wasmtime-go)
 runtime, with a hand-written Emscripten/WASI host layer and an in-memory virtual
 filesystem. Queries run over the actual PostgreSQL v3 **wire protocol** against one
@@ -160,3 +160,8 @@ internal/fetchwasm/   `go generate` fetcher: pulls the PGlite wasm assets from j
 
 Built on [PGlite](https://github.com/electric-sql/pglite) by ElectricSQL and
 [wasmtime](https://github.com/bytecodealliance/wasmtime) by the Bytecode Alliance.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). See [`NOTICE`](NOTICE)
+for third-party attributions (PGlite, wasmtime, wazero) redistributed with this work.

@@ -1,0 +1,23 @@
+pglite-go
+Copyright 2026 Moriyoshi Koizumi
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product bundles or depends on the following third-party components:
+
+- PGlite (https://github.com/electric-sql/pglite), by ElectricSQL.
+  Licensed under the Apache License, Version 2.0. The PGlite WebAssembly
+  assets (pglite.wasm, initdb.wasm, pglite.data, pglite.manifest.json) are
+  fetched at build/run time and, when embedded, redistributed with this work.
+  PGlite embeds PostgreSQL, which is distributed under the PostgreSQL License.
+
+- wasmtime and wasmtime-go
+  (https://github.com/bytecodealliance/wasmtime,
+  https://github.com/bytecodealliance/wasmtime-go), by the Bytecode Alliance.
+  Licensed under the Apache License, Version 2.0 with the LLVM exception.
+
+- wazero (https://github.com/tetratelabs/wazero), by Tetrate.
+  Licensed under the Apache License, Version 2.0.
+
+- golang.org/x/sys, by The Go Authors.
+  Licensed under the BSD 3-Clause License.
