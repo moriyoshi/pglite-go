@@ -36,6 +36,11 @@ const (
 	defaultTableBase    = 0
 	defaultStackPointer = 10937088 // same as __heap_base in the JS
 	defaultHeapBase     = 10937088
+
+	// reservedTableSlots is the number of function-table entries reserved above
+	// the module's own indirect functions for host callbacks (RW hooks need 2,
+	// initdb's system/popen/pclose need 3); the extra headroom is harmless.
+	reservedTableSlots = 16
 )
 
 // PrepareAndCompile patches the WASM binary to redirect non-function imports
@@ -76,11 +81,18 @@ func PrepareAndCompilePrepatched(ctx context.Context, r wazero.Runtime, patchedW
 		return nil, fmt.Errorf("instantiate GOT.mem: %w", err)
 	}
 
-	// Step 4: Set up env.extras module (globals, memory, table)
+	// Step 4: Set up env.extras module (globals, memory, table). The table must
+	// hold the module's own indirect functions plus a reserved tail where the
+	// host installs its callbacks (see WZRuntime.callbackBase). Size it from the
+	// module's dylink info rather than a hardcoded, version-specific constant.
+	_, tableSize, derr := ParseDylink(patchedWasm)
+	if derr != nil {
+		return nil, fmt.Errorf("parse dylink: %w", derr)
+	}
 	envExtrasWasm := buildEnvExtrasModule(
-		2048,  // min pages (128MB)
-		32768, // max pages (2GB)
-		6098,  // table min size (table_base=1 + dylink tablesize=6097)
+		2048,                           // min pages (128MB)
+		32768,                          // max pages (2GB)
+		tableSize+1+reservedTableSlots, // module funcs + null slot + host callback tail
 		[]globalDef{
 			{name: "__memory_base", valType: 0x7f, mutable: false, initI32: defaultMemoryBase},
 			{name: "__stack_pointer", valType: 0x7f, mutable: true, initI32: defaultStackPointer},

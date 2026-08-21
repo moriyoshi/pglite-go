@@ -690,6 +690,17 @@ func (fs *FS) Dup(oldFD int32) (int32, error) {
 	defer fs.mu.Unlock()
 	of, ok := fs.fds[oldFD]
 	if !ok {
+		// Standard streams (0=stdin, 1=stdout, 2=stderr) are serviced by the
+		// WASI layer, not the VFS fd table, so they never appear in fs.fds.
+		// PostgreSQL's set_max_safe_fds() probes descriptor availability by
+		// dup()ing stderr many times and immediately closing the copies; hand
+		// out a placeholder descriptor so the probe (and any close) succeeds.
+		if oldFD >= 0 && oldFD <= 2 {
+			newFD := fs.nextFD
+			fs.nextFD++
+			fs.fds[newFD] = &OpenFile{Path: fmt.Sprintf("/dev/std%d", oldFD)}
+			return newFD, nil
+		}
 		return -1, fmt.Errorf("dup: bad fd %d", oldFD)
 	}
 	newFD := fs.nextFD

@@ -1,11 +1,11 @@
-//go:build !wazero
-
 // Command pglite is a small demo of the embedded PostgreSQL library: it opens a
 // cluster (initdb on first run, load-and-skip-initdb after) and runs a query.
-// For the standard Go database API, use the "pglite" database/sql driver — see
-// package github.com/moriyoshi/pglite-go/pgdriver.
+// It builds on both backends — wasmtime by default, or pure-Go wazero with
+// -tags wazero. For the standard Go database API, use the "pglite" database/sql
+// driver — see package github.com/moriyoshi/pglite-go/pgdriver.
 //
 //	go run ./cmd/pglite [wasmDir]
+//	go run -tags wazero ./cmd/pglite [wasmDir]
 package main
 
 import (

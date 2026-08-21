@@ -17,10 +17,10 @@ import (
 
 // WASI errno values
 const (
-	wasiSuccess    = 0
-	wasiBadf       = 8
-	wasiInval      = 28
-	wasiNosys      = 52
+	wasiSuccess = 0
+	wasiBadf    = 8
+	wasiInval   = 28
+	wasiNosys   = 52
 )
 
 // InstantiateWASIWithCapture is like InstantiateWASI but captures stdout to a buffer.
@@ -59,6 +59,12 @@ type WASIInstance struct {
 func (w *WASIInstance) SetStdoutCapture(buf *[]byte) {
 	w.impl.StdoutOverride = buf
 }
+
+// SetStdout redirects fd 1 writes to w (e.g. io.Discard to silence the backend).
+func (w *WASIInstance) SetStdout(out io.Writer) { w.impl.stdout = out }
+
+// SetStderr redirects fd 2 writes to w.
+func (w *WASIInstance) SetStderr(out io.Writer) { w.impl.stderr = out }
 
 func instantiateWASIImpl(ctx context.Context, r wazero.Runtime, fs *vfs.FS, stdinData []byte, stdoutCapture *[]byte) error {
 	_, err := instantiateWASIFull(ctx, r, fs, stdinData, stdoutCapture)
@@ -428,7 +434,7 @@ func (w *wasiImpl) fdPread() api.GoModuleFunc {
 
 		// Save current position, seek, read, restore
 		oldPos, _ := w.fs.Seek(fd, 0, 1) // SEEK_CUR
-		w.fs.Seek(fd, offset, 0)          // SEEK_SET
+		w.fs.Seek(fd, offset, 0)         // SEEK_SET
 
 		totalRead := uint32(0)
 		for i := uint32(0); i < iovsLen; i++ {

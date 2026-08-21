@@ -58,38 +58,38 @@ func writeToMem(mem api.Memory, ptr uint32, data []byte) bool {
 // Register registers all syscall implementations on the given handler map.
 func (h *SyscallHandler) Register() map[string]api.GoModuleFunc {
 	return map[string]api.GoModuleFunc{
-		"__syscall_openat":     h.syscallOpenat(),
-		"__syscall_fstat64":    h.syscallFstat64(),
-		"__syscall_stat64":     h.syscallStat64(),
-		"__syscall_lstat64":    h.syscallLstat64(),
-		"__syscall_newfstatat": h.syscallNewfstatat(),
-		"__syscall_getcwd":     h.syscallGetcwd(),
-		"__syscall_chdir":      h.syscallChdir(),
-		"__syscall_mkdirat":    h.syscallMkdirat(),
-		"__syscall_unlinkat":   h.syscallUnlinkat(),
-		"__syscall_renameat":   h.syscallRenameat(),
-		"__syscall_faccessat":  h.syscallFaccessat(),
-		"__syscall_fcntl64":    h.syscallFcntl64(),
-		"__syscall_ioctl":      h.syscallIoctl(),
-		"__syscall_dup":        h.syscallDup(),
-		"__syscall_dup3":       h.syscallDup3(),
-		"__syscall_fchmod":     h.syscallFchmod(),
-		"__syscall_chmod":      h.syscallChmod(),
-		"__syscall_fchown32":   h.syscallFchown32(),
-		"__syscall_fchownat":   h.syscallFchownat(),
-		"__syscall_fchmodat2":  h.syscallFchmodat2(),
-		"__syscall_rmdir":      h.syscallRmdir(),
-		"__syscall_getdents64": h.syscallGetdents64(),
-		"__syscall_readlinkat": h.syscallReadlinkat(),
-		"__syscall_symlinkat":  h.syscallSymlinkat(),
-		"__syscall_fdatasync":  h.syscallFdatasync(),
+		"__syscall_openat":      h.syscallOpenat(),
+		"__syscall_fstat64":     h.syscallFstat64(),
+		"__syscall_stat64":      h.syscallStat64(),
+		"__syscall_lstat64":     h.syscallLstat64(),
+		"__syscall_newfstatat":  h.syscallNewfstatat(),
+		"__syscall_getcwd":      h.syscallGetcwd(),
+		"__syscall_chdir":       h.syscallChdir(),
+		"__syscall_mkdirat":     h.syscallMkdirat(),
+		"__syscall_unlinkat":    h.syscallUnlinkat(),
+		"__syscall_renameat":    h.syscallRenameat(),
+		"__syscall_faccessat":   h.syscallFaccessat(),
+		"__syscall_fcntl64":     h.syscallFcntl64(),
+		"__syscall_ioctl":       h.syscallIoctl(),
+		"__syscall_dup":         h.syscallDup(),
+		"__syscall_dup3":        h.syscallDup3(),
+		"__syscall_fchmod":      h.syscallFchmod(),
+		"__syscall_chmod":       h.syscallChmod(),
+		"__syscall_fchown32":    h.syscallFchown32(),
+		"__syscall_fchownat":    h.syscallFchownat(),
+		"__syscall_fchmodat2":   h.syscallFchmodat2(),
+		"__syscall_rmdir":       h.syscallRmdir(),
+		"__syscall_getdents64":  h.syscallGetdents64(),
+		"__syscall_readlinkat":  h.syscallReadlinkat(),
+		"__syscall_symlinkat":   h.syscallSymlinkat(),
+		"__syscall_fdatasync":   h.syscallFdatasync(),
 		"__syscall_ftruncate64": h.syscallFtruncate64(),
-		"__syscall_truncate64": h.syscallTruncate64(),
-		"__syscall_pipe":       h.syscallPipe(),
-		"__syscall_fadvise64":  h.syscallFadvise64(),
-		"__syscall_fallocate":  h.syscallFallocate(),
-		"__syscall_statfs64":   h.syscallStatfs64(),
-		"__syscall_utimensat":  h.syscallUtimensat(),
+		"__syscall_truncate64":  h.syscallTruncate64(),
+		"__syscall_pipe":        h.syscallPipe(),
+		"__syscall_fadvise64":   h.syscallFadvise64(),
+		"__syscall_fallocate":   h.syscallFallocate(),
+		"__syscall_statfs64":    h.syscallStatfs64(),
+		"__syscall_utimensat":   h.syscallUtimensat(),
 	}
 }
 
@@ -158,11 +158,11 @@ func writeStat64(mem api.Memory, buf uint32, node *vfs.Node) {
 		size = uint64(len(node.Target))
 	}
 
-	binary.LittleEndian.PutUint32(statBuf[0:], 1)    // st_dev
+	binary.LittleEndian.PutUint32(statBuf[0:], 1)     // st_dev
 	binary.LittleEndian.PutUint32(statBuf[4:], mode)  // st_mode
 	binary.LittleEndian.PutUint32(statBuf[8:], 1)     // st_nlink
-	binary.LittleEndian.PutUint64(statBuf[24:], size)  // st_size
-	binary.LittleEndian.PutUint32(statBuf[32:], 4096)  // st_blksize
+	binary.LittleEndian.PutUint64(statBuf[24:], size) // st_size
+	binary.LittleEndian.PutUint32(statBuf[32:], 4096) // st_blksize
 	blocks := int32((size + 511) / 512)
 	binary.LittleEndian.PutUint32(statBuf[36:], uint32(blocks)) // st_blocks
 
@@ -593,10 +593,10 @@ func (h *SyscallHandler) syscallStatfs64() api.GoModuleFunc {
 		// Write a minimal statfs structure
 		var statfs [64]byte
 		binary.LittleEndian.PutUint32(statfs[0:], 0x9fa0) // f_type = TMPFS_MAGIC
-		binary.LittleEndian.PutUint32(statfs[4:], 4096)    // f_bsize
-		binary.LittleEndian.PutUint64(statfs[8:], 1<<30)   // f_blocks
-		binary.LittleEndian.PutUint64(statfs[16:], 1<<29)  // f_bfree
-		binary.LittleEndian.PutUint64(statfs[24:], 1<<29)  // f_bavail
+		binary.LittleEndian.PutUint32(statfs[4:], 4096)   // f_bsize
+		binary.LittleEndian.PutUint64(statfs[8:], 1<<30)  // f_blocks
+		binary.LittleEndian.PutUint64(statfs[16:], 1<<29) // f_bfree
+		binary.LittleEndian.PutUint64(statfs[24:], 1<<29) // f_bavail
 		mod.Memory().Write(buf, statfs[:])
 		stack[0] = 0
 	})

@@ -1,5 +1,3 @@
-//go:build !wazero
-
 package pglite
 
 // Rows is the structured result of a query, decoded from the PostgreSQL wire

@@ -14,6 +14,7 @@ package emscripten
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"math"
@@ -28,6 +29,9 @@ import (
 
 const longjmpSentinel = "__emscripten_longjmp__"
 const heapBase = defaultHeapBase
+
+// Compile-time check that the wasmtime backend satisfies the shared interface.
+var _ Runtime = (*WTRuntime)(nil)
 
 // WTRuntime holds a wasmtime instance wired with our host layer.
 type WTRuntime struct {
@@ -643,14 +647,6 @@ func (rt *WTRuntime) RegisterInitdbCallbacks(cb *InitdbCallbacks) (uint32, error
 	return base, nil
 }
 
-// RWCallbacks are the PGlite socket read/write hooks. Read fills dst with
-// client→server bytes (non-blocking; returns the count, possibly 0). Write
-// receives a copy of server→client bytes.
-type RWCallbacks struct {
-	Read  func(dst []byte) int
-	Write func(src []byte)
-}
-
 // RegisterRWCallbacks places the read/write callbacks into the shared table and
 // returns the base index; pass base+0 (read) and base+1 (write) to
 // pgl_set_rw_cbs. The callbacks operate directly on guest memory.
@@ -722,6 +718,35 @@ func (rt *WTRuntime) ApplyDataRelocs(_ context.Context) error {
 	}
 	_, err := f.Call(rt.store)
 	return err
+}
+
+// FindStdoutFILE locates musl's static stdout FILE struct in linear memory by
+// its initialized-data signature, so callers don't have to hardcode a
+// build-specific address (which shifts with every PGlite/PostgreSQL rebuild).
+//
+// initdb's popen("w", ...) bootstrap-SQL pipe is serviced by handing back the
+// address of the real stdout FILE and capturing what gets written to fd 1 (see
+// runInitdb). musl statically initializes __stdout_FILE with flags=F_PERM|F_NORD
+// (5), buf_size=BUFSIZ (1024), fd=1, and lock=-1; that quadruple is unique in
+// the module's data image. Call after ApplyDataRelocs. Returns 0 if not found.
+func (rt *WTRuntime) FindStdoutFILE() uint32 {
+	mem := rt.memory.UnsafeData(rt.store)
+	const (
+		offFlags   = 0
+		offBufSize = 48
+		offFD      = 60
+		offLock    = 76
+		fileMin    = 84
+	)
+	u32 := func(p int) uint32 { return binary.LittleEndian.Uint32(mem[p : p+4]) }
+	i32 := func(p int) int32 { return int32(u32(p)) }
+	for p := 0; p+fileMin <= len(mem); p += 4 {
+		if u32(p+offFlags) == 5 && i32(p+offFD) == 1 &&
+			i32(p+offLock) == -1 && i32(p+offBufSize) == 1024 {
+			return uint32(p)
+		}
+	}
+	return 0
 }
 
 // CallMain sets up argv on the Emscripten stack and calls __main_argc_argv.

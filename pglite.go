@@ -1,8 +1,7 @@
-//go:build !wazero
-
 // Package pglite embeds PostgreSQL in Go by running PGlite (PostgreSQL compiled
-// to WebAssembly) on the wasmtime runtime, with a hand-written Emscripten/WASI
-// host layer and an in-memory VFS.
+// to WebAssembly) on a WebAssembly runtime — wasmtime by default, or pure-Go
+// wazero with -tags wazero — with a hand-written Emscripten/WASI host layer and
+// an in-memory VFS.
 //
 // A DB is a cluster: Open initializes (or loads a persisted) data directory,
 // keeps it in an in-memory filesystem, and starts one persistent PostgreSQL
@@ -22,8 +21,6 @@ package pglite
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -31,9 +28,6 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/bytecodealliance/wasmtime-go/v34"
-
-	emcompat "github.com/moriyoshi/pglite-go/emscripten"
 	"github.com/moriyoshi/pglite-go/vfs"
 )
 
@@ -61,8 +55,8 @@ const dataDir = "/tmp/pglite/data"
 // (including database/sql's pool) block rather than race.
 type DB struct {
 	cfg         Config
-	engine      *wasmtime.Engine
-	postgresMod *wasmtime.Module
+	engine      wasmEngine
+	postgresMod wasmModule
 	fs          *vfs.FS
 	persistDir  string
 	database    string
@@ -104,8 +98,8 @@ func Open(cfg Config) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read pglite.wasm: %w", err)
 	}
-	db.engine = wasmtime.NewEngine()
-	mod, _, err := compileCached(db.engine, postgresWasm, "pglite")
+	db.engine = newEngine()
+	mod, err := compileModule(db.engine, postgresWasm, "pglite")
 	if err != nil {
 		return nil, fmt.Errorf("compile pglite.wasm: %w", err)
 	}
@@ -171,16 +165,14 @@ func (db *DB) Close() error {
 		db.wire = nil
 	}
 	err := db.syncLocked()
-	if db.engine != nil {
-		db.engine.Close()
-	}
+	closeEngine(db.engine)
 	return err
 }
 
-// runCmd runs a postgres subcommand in a fresh wasmtime instance against the
+// runCmd runs a postgres subcommand in a fresh runtime instance against the
 // shared VFS, reusing the once-compiled module.
 func (db *DB) runCmd(ctx context.Context, args []string, stdin []byte, stdoutCapture *[]byte) (int32, error) {
-	rt, err := emcompat.NewWTRuntimeFromModule(ctx, db.engine, db.postgresMod, db.fs, stdin, stdoutCapture)
+	rt, err := newRuntimeFromModule(ctx, db.engine, db.postgresMod, db.fs, stdin, stdoutCapture)
 	if err != nil {
 		return -1, err
 	}
@@ -188,13 +180,22 @@ func (db *DB) runCmd(ctx context.Context, args []string, stdin []byte, stdoutCap
 	if stdoutCapture == nil {
 		rt.SetStdout(io.Discard)
 	}
-	rt.SetStderr(io.Discard)
+	dbg := os.Getenv("PGLITE_DEBUG_INITDB") != ""
+	if dbg {
+		rt.SetStderr(os.Stderr)
+		fmt.Fprintf(os.Stderr, "[runCmd] %v (stdin=%d bytes)\n", args, len(stdin))
+	} else {
+		rt.SetStderr(io.Discard)
+	}
 	if err := rt.ApplyDataRelocs(ctx); err != nil {
 		return -1, err
 	}
 	code, err := rt.CallMain(ctx, args)
 	if err != nil {
 		msg := err.Error()
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[runCmd] %v -> err: %s\n", args, msg)
+		}
 		if strings.Contains(msg, "exit(0)") {
 			return 0, nil
 		}
@@ -204,35 +205,6 @@ func (db *DB) runCmd(ctx context.Context, args []string, stdin []byte, stdoutCap
 		return -1, err
 	}
 	return code, nil
-}
-
-func compileCached(engine *wasmtime.Engine, wasm []byte, name string) (*wasmtime.Module, bool, error) {
-	dir := ""
-	if d, err := os.UserCacheDir(); err == nil {
-		dir = filepath.Join(d, "pglite-go", "wasmtime")
-	}
-	sum := sha256.Sum256(wasm)
-	path := ""
-	if dir != "" {
-		path = filepath.Join(dir, fmt.Sprintf("%s-%s.cwasm", name, hex.EncodeToString(sum[:8])))
-		if mod, err := wasmtime.NewModuleDeserializeFile(engine, path); err == nil {
-			return mod, true, nil
-		}
-	}
-	mod, err := wasmtime.NewModule(engine, wasm)
-	if err != nil {
-		return nil, false, err
-	}
-	if path != "" {
-		if blob, serr := mod.Serialize(); serr == nil {
-			_ = os.MkdirAll(dir, 0o755)
-			tmp := path + ".tmp"
-			if os.WriteFile(tmp, blob, 0o644) == nil {
-				_ = os.Rename(tmp, path)
-			}
-		}
-	}
-	return mod, false, nil
 }
 
 func isPersistedCluster(persistDir string) bool {

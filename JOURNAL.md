@@ -620,6 +620,115 @@ subcommands, which are fed bootstrap SQL via the surviving byte-slice `stdinData
 path. Also, initdb's own stdout/stderr are now routed to `io.Discard`, so the library
 is fully quiet (an ephemeral, full-initdb run emits only the caller's output).
 
+## Porting to PGlite 0.5.5 / PostgreSQL 18.3 (2026-08-21)
+
+`scripts/update-wasm.sh` defaults to npm's `latest` dist-tag, so refreshing the
+vendored assets jumped the build from **PGlite 0.4.2 (PostgreSQL 17.5)** to **0.5.5
+(PostgreSQL 18.3)** — `strings wasm/pglite.wasm | grep PostgreSQL` reports
+`PostgreSQL 18.3 (PGlite 0.5.5) on wasm32-unknown-linux-gnu`. `pglite.wasm` grew
+8.7 MB → 10.1 MB. The reverse-engineered initdb/wire glue is pinned to specific
+guest-memory addresses and PostgreSQL-version behaviour, so the suite went red with
+`initdb produced no valid cluster (missing /global/pg_control)`. Two version-specific
+fixes brought it back to green.
+
+**1. Bootstrap-SQL capture — stdout `FILE*` address.** initdb runs
+`popen("postgres --boot …", "w")` and writes ~950 KB of bootstrap SQL to that pipe.
+We fake the pipe by pointing the guest's `stdout` `FILE` at a capture buffer, keyed
+off the address of musl's static `__stdout_FILE`. That address moved between builds:
+`29560` (0.4.2) → **`97448`** (0.5.5). With the stale address the capture returned
+0 bytes, `--boot` got no stdin, and no `pg_control` was written — a silent failure
+(initdb printed nothing to stderr). New value re-derived from the initdb.wasm layout;
+see `cluster.go` `OnPopen`.
+
+**2. PostgreSQL 18 file-descriptor probe.** On startup PG 18's `set_max_safe_fds()`
+calls `count_usable_fds()`, which `dup()`s `stderr` (fd 2) ~58 times to measure how
+many descriptors it can safely open, then closes the copies. Our stdio fds 0/1/2 are
+serviced by the WASI layer and never appear in `vfs.FS.fds`, so `dup(2)` returned
+`EBADF`; PG logged `duplicating stderr file descriptor failed after 0 successes` and
+aborted with `insufficient file descriptors available to start server process
+(System allows 0, server needs at least 58)`. PG 17.5 didn't run this probe on the
+`--boot` path. Fix: `vfs.FS.Dup` now hands out placeholder descriptors for fds 0/1/2
+so the probe (and the follow-up closes) succeed.
+
+With both in place the `--boot` phase exits 0 and writes `pg_control`; the full
+`pgdriver` suite (CRUD, binary result formats, transactions) and `vfs` pass, and the
+`-tags wazero` fallback still builds.
+
+**Known non-fatal issue.** initdb's post-bootstrap `postgres --single template1`
+phase FATALs with `could not open collator for locale "und": U_FILE_ACCESS_ERROR` —
+PG 18 opens the ICU **root** collator even though initdb runs with
+`--locale-provider=libc --locale=C.UTF-8`. The phase aborts on its tail, but the
+essential catalog is already in place, so every test passes. Some late system objects
+may be missing; unresolved, and worth confirming before relying on ICU collations.
+
+**Debugging aids added.** `PGLITE_DEBUG_INITDB=1` routes initdb's stderr through and
+traces each `system`/`popen`/`pclose` call plus the `--boot` exit code and
+`pg_control` presence — this is what localized both failures. To go back to the
+older, fully-reverse-engineered build: `PGLITE_VERSION=0.4.2 ./scripts/update-wasm.sh`.
+
+Also removed seven obsolete diagnostic commands under `cmd/` (`bench-wasmtime`,
+`dump-imports`, `inspect-wasm`, `probe-wasmedge`, `probe-wasmtime`, `prof-compile`,
+`wire-probe`); `cmd/pglite` (library demo) and `cmd/pglite-poc` (pure-Go wazero
+fallback) remain.
+
+## Wazero backend: full wire parity, one demo (2026-08-21)
+
+The pure-Go wazero path used to be a separate self-contained program
+(`cmd/pglite-poc`) on the old `postgres --single` query path, while the library,
+wire protocol, and `database/sql` driver were wasmtime-only (`//go:build
+!wazero`). Consolidated to **one command, one demo**: `cmd/pglite` now builds on
+both backends from a single source file, and wazero runs the *same* library and
+wire protocol as wasmtime — no feature or query-path difference.
+
+**Architecture.** Introduced `emcompat.Runtime`, a backend-agnostic interface
+(CallExport/CallExportRaw/CallMain, RegisterRWCallbacks/RegisterInitdbCallbacks,
+ApplyDataRelocs, FindStdoutFILE, SetStdout/Stderr/StdoutCapture). `*WTRuntime`
+(wasmtime) and the new `*WZRuntime` (wazero) both implement it, so `pglite.go`,
+`wire.go`, `query.go`, and `cluster.go` dropped their build tags and are written
+once against the interface. A small tagged shim (`backend_wasmtime.go` /
+`backend_wazero.go`) provides the `wasmEngine`/`wasmModule` aliases and the
+`newEngine`/`compileModule`/`newRuntimeFrom{Module,Wasm}` constructors. The mmap
+linear-memory allocator moved into the root package (wazero-tagged).
+
+Two things had to be re-implemented for wazero, which (unlike wasmtime-go) exposes
+neither a runtime table-mutation API nor a longjmp trap:
+
+- **Host callbacks into the function table.** wazero can't append host funcs to
+  the indirect table at runtime, so `RegisterRWCallbacks`/`RegisterInitdbCallbacks`
+  generate a tiny bridge wasm module that imports the shared table and the host
+  functions and uses a static **element segment** to place wrapper functions at a
+  reserved base index. The base sits *above* the module's own entries: the env.extras
+  table is now sized from the module's **dylink `table_size`** (parsed by
+  `ParseDylink`) instead of the old hardcoded `6098`, plus `reservedTableSlots`
+  headroom, and callbacks go at `tableSize+1`. (The 0.4.2 constant was also just
+  wrong for 0.5.5, whose `pglite.wasm` needs `table_size=7366`.)
+- **longjmp out of an export.** In wire mode `PostgresMainLoopOnce` returns via
+  Emscripten longjmp. wazero's built-in `_emscripten_throw_longjmp` panics with an
+  error that wazero wraps (`%w`) into the value returned from `Call`, so
+  `WZRuntime.CallExportRaw` detects it by the substring `_emscripten_throw_longjmp`
+  — the exact analogue of the wasmtime port's trap-sentinel check. `proc_exit(N)`
+  likewise surfaces as an error string containing `exit(N)`, so `runCmd`'s existing
+  matching works unchanged across both backends.
+
+**Validated end-to-end** (`go run -tags wazero ./cmd/pglite`, `CGO_ENABLED=0`):
+full initdb (multiple `postgres` subcommands over wazero) + `pgl_set_rw_cbs`
+handshake + `SELECT 1+1` → `2 | hello, pglite`. Cold ~315 s (dominated by the
+one-time 10 MB `pglite.wasm` compile); warm (cache + skip-initdb) ~4.1 s. The
+wasmtime suite (`pgdriver`, `vfs`) stayed green throughout the refactor, and both
+backends build+vet clean.
+
+**Files.** New: `emscripten/runtime.go` (the `Runtime` interface + `RWCallbacks`,
+moved off the wasmtime file), `emscripten/wazero_port.go` (`WZRuntime` + the RW
+bridge builder), `emscripten/dylink.go` (`ParseDylink`), `backend_wasmtime.go` /
+`backend_wazero.go` (the tagged engine/module shims), `mmap_alloc.go` /
+`mmap_alloc_other.go` (moved from the deleted poc). Changed: `pglite.go`,
+`wire.go`, `query.go`, `cluster.go` (tags dropped, now interface-driven);
+`emscripten/syscall.go` (dylink-derived table size + `reservedTableSlots`);
+`emscripten/systemcb.go` (`instantiateInitdbCallbacksInto` for externally-owned
+callbacks); `emscripten/wasi.go` (`WASIInstance.SetStdout/SetStderr`);
+`emscripten/wasmtime_port.go` (`RWCallbacks` moved out, interface assertion).
+Removed: `cmd/pglite-poc/`.
+
 ## Timeline
 
 | Milestone | Status |
@@ -649,5 +758,8 @@ is fully quiet (an ephemeral, full-initdb run emits only the caller's output).
 | database/sql driver + sqlx | Done (typed rows, params, NULL) |
 | Persistent session + real transactions | Done (cross-call BEGIN/COMMIT/ROLLBACK, -race clean) |
 | Wire protocol (pgl_set_rw_cbs) | Done — typed results, RowsAffected, server-side prepared stmts |
-| `database/sql` driver interface | Not started |
-| VFS persistence | Not started |
+| Binary result formats (int/float/bool/bytea) | Done |
+| Port to PGlite 0.5.5 / PostgreSQL 18.3 | Done — FILE* addr 29560→97448, PG18 fd-probe Dup fix |
+| ICU "und" collator in initdb post-bootstrap | Open (non-fatal; tests pass) |
+| wazero backend: full wire parity via emcompat.Runtime | Done — one `cmd/pglite` on both backends; poc removed |
+| Warm-start persistence hang on 0.5.5 user-table scans | Open (see memory note; ephemeral works) |

@@ -110,7 +110,10 @@ func buildCallbackBridgeModule(baseIndex uint32) []byte {
 	var importPayload []byte
 	importPayload = append(importPayload, encodeLEB128U(5)...)
 	// Import host functions
-	for _, f := range []struct{ name string; typeIdx byte }{
+	for _, f := range []struct {
+		name    string
+		typeIdx byte
+	}{
 		{"handle_system", 0},
 		{"handle_popen", 1},
 		{"handle_pclose", 0},
@@ -139,7 +142,7 @@ func buildCallbackBridgeModule(baseIndex uint32) []byte {
 	elemPayload = append(elemPayload, 0x41)                // i32.const
 	elemPayload = append(elemPayload, encodeLEB128S(int64(baseIndex))...)
 	elemPayload = append(elemPayload, 0x0b)                // end
-	elemPayload = append(elemPayload, encodeLEB128U(3)...)  // 3 function refs
+	elemPayload = append(elemPayload, encodeLEB128U(3)...) // 3 function refs
 	// Func indices: 3 imported + 3 defined = indices 3, 4, 5
 	elemPayload = append(elemPayload, encodeLEB128U(3)...) // wrapper_system
 	elemPayload = append(elemPayload, encodeLEB128U(4)...) // wrapper_popen
@@ -173,8 +176,19 @@ func InstantiateInitdbCallbacks(
 	r wazero.Runtime,
 	baseIndex uint32,
 ) (*InitdbCallbacks, error) {
-	handler := &InitdbCallbacks{}
+	return instantiateInitdbCallbacksInto(ctx, r, baseIndex, &InitdbCallbacks{})
+}
 
+// instantiateInitdbCallbacksInto wires the given handler's system/popen/pclose
+// hooks into a bridge placed at baseIndex, so the WZRuntime path can install an
+// externally-owned InitdbCallbacks (matching the wasmtime RegisterInitdbCallbacks
+// contract).
+func instantiateInitdbCallbacksInto(
+	ctx context.Context,
+	r wazero.Runtime,
+	baseIndex uint32,
+	handler *InitdbCallbacks,
+) (*InitdbCallbacks, error) {
 	// Register host functions
 	hostBuilder := r.NewHostModuleBuilder("initdb_host")
 

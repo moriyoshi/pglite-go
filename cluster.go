@@ -1,11 +1,10 @@
-//go:build !wazero
-
 package pglite
 
 import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 
 	emcompat "github.com/moriyoshi/pglite-go/emscripten"
@@ -44,15 +43,28 @@ func insertDataDir(args []string) []string {
 // pclose calls (which spawn postgres --boot/--single subcommands) back into
 // fresh wasmtime instances over the shared VFS.
 func (db *DB) runInitdb(ctx context.Context, initdbWasm, postgresWasm []byte) error {
-	rt, err := emcompat.NewWTRuntime(ctx, db.engine, initdbWasm, db.fs, nil, nil)
+	dbg := os.Getenv("PGLITE_DEBUG_INITDB") != ""
+	rt, err := newRuntimeFromWasm(ctx, db.engine, initdbWasm, db.fs, nil, nil)
 	if err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
 	// Keep the library quiet: initdb prints progress to stdout/stderr.
 	rt.SetStdout(io.Discard)
-	rt.SetStderr(io.Discard)
+	if dbg {
+		rt.SetStderr(os.Stderr)
+	} else {
+		rt.SetStderr(io.Discard)
+	}
 	if err := rt.ApplyDataRelocs(ctx); err != nil {
 		return fmt.Errorf("relocs: %w", err)
+	}
+
+	// Locate initdb's stdout FILE* so the popen("w") bootstrap-SQL pipe can be
+	// serviced by capturing writes to fd 1 (see OnPopen). The address shifts with
+	// every PGlite rebuild, so derive it from memory rather than hardcoding it.
+	stdoutFILE := rt.FindStdoutFILE()
+	if stdoutFILE == 0 {
+		return fmt.Errorf("could not locate stdout FILE struct in initdb.wasm (PGlite layout changed?)")
 	}
 
 	cb := &emcompat.InitdbCallbacks{}
@@ -67,6 +79,9 @@ func (db *DB) runInitdb(ctx context.Context, initdbWasm, postgresWasm []byte) er
 	var capturedStdout *[]byte
 
 	cb.OnSystem = func(ctx context.Context, cmd string) int32 {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[initdb] system(%q)\n", cmd)
+		}
 		prog, args := emcompat.ParseSystemCommand(cmd)
 		if !strings.Contains(prog, "postgres") {
 			return -1
@@ -82,6 +97,9 @@ func (db *DB) runInitdb(ctx context.Context, initdbWasm, postgresWasm []byte) er
 	}
 
 	cb.OnPopen = func(ctx context.Context, cmd string, mode string) int32 {
+		if dbg {
+			fmt.Fprintf(os.Stderr, "[initdb] popen(%q, %q)\n", cmd, mode)
+		}
 		prog, args := emcompat.ParseSystemCommand(cmd)
 		if !strings.Contains(prog, "postgres") {
 			return 0
@@ -97,7 +115,7 @@ func (db *DB) runInitdb(ctx context.Context, initdbWasm, postgresWasm []byte) er
 		var captured []byte
 		capturedStdout = &captured
 		rt.SetStdoutCapture(capturedStdout)
-		return 29560 // stdout FILE* address (from the initdb disassembly)
+		return int32(stdoutFILE)
 	}
 
 	cb.OnPclose = func(ctx context.Context, stream int32) int32 {
@@ -112,9 +130,16 @@ func (db *DB) runInitdb(ctx context.Context, initdbWasm, postgresWasm []byte) er
 		pendingPgArgs = nil
 		if capturedStdout != nil {
 			db.fs.WriteFile(popenFile, *capturedStdout, 0o644)
+			if dbg {
+				fmt.Fprintf(os.Stderr, "[initdb] pclose: captured %d bytes of bootstrap SQL; running %v\n", len(*capturedStdout), args)
+			}
 			capturedStdout = nil
 		}
 		lastPgResult, _ = db.runCmd(ctx, args, db.readVFS(popenFile), nil)
+		if dbg {
+			_, statErr := db.fs.Stat(dataDir + "/global/pg_control")
+			fmt.Fprintf(os.Stderr, "[initdb] postgres --boot exit=%d; pg_control present=%v\n", lastPgResult, statErr == nil)
+		}
 		return lastPgResult
 	}
 

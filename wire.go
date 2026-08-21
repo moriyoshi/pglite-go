@@ -1,5 +1,3 @@
-//go:build !wazero
-
 package pglite
 
 import (
@@ -8,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 
@@ -25,7 +24,7 @@ import (
 // until the input is consumed and no buffered data remains; the backend's writes
 // are captured in `in` and decoded.
 type wireConn struct {
-	rt  *emcompat.WTRuntime
+	rt  emcompat.Runtime
 	out []byte // client->server staging
 	off int
 	in  []byte // server->client capture
@@ -37,6 +36,12 @@ var defaultStartParams = []string{
 	"-c", "search_path=public",
 	"-c", "exit_on_error=false",
 	"-c", "log_checkpoints=false",
+	// PG18 defaults io_method=worker: seq scans dispatch async buffer reads and
+	// wait on an I/O worker to complete them. This single-process wasm embedding
+	// has no I/O workers, so that wait never returns — any scan that reads a page
+	// from disk (e.g. a user table after a warm restart) hangs forever. Force
+	// synchronous reads. (PG17 and earlier had no async I/O, hence no hang there.)
+	"-c", "io_method=sync",
 }
 
 func (w *wireConn) read(dst []byte) int { n := copy(dst, w.out[w.off:]); w.off += n; return n }
@@ -44,7 +49,7 @@ func (w *wireConn) write(src []byte)    { w.in = append(w.in, src...) }
 
 func (db *DB) startWire() (*wireConn, error) {
 	ctx := context.Background()
-	rt, err := emcompat.NewWTRuntimeFromModule(ctx, db.engine, db.postgresMod, db.fs, nil, nil)
+	rt, err := newRuntimeFromModule(ctx, db.engine, db.postgresMod, db.fs, nil, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +59,11 @@ func (db *DB) startWire() (*wireConn, error) {
 	// The wire backend talks to us over the rw callbacks; its fd 1/2 chatter
 	// (banner, server log) is noise for a library — discard it.
 	rt.SetStdout(io.Discard)
-	rt.SetStderr(io.Discard)
+	if os.Getenv("PGLITE_DEBUG_INITDB") != "" {
+		rt.SetStderr(os.Stderr)
+	} else {
+		rt.SetStderr(io.Discard)
+	}
 	w := &wireConn{rt: rt}
 
 	// Wire mode loads pg_hba.conf (single-user never does). The default file's
@@ -228,12 +237,12 @@ func bindMessage(params []string, isNull []bool, formats []int16) []byte {
 // losslessly. Everything else stays text (and is returned as a string unless
 // decodeText knows a typed form).
 var binaryOID = map[uint32]bool{
-	16: true, // bool
-	17: true, // bytea
-	20: true, // int8
-	21: true, // int2
-	23: true, // int4
-	26: true, // oid
+	16:  true, // bool
+	17:  true, // bytea
+	20:  true, // int8
+	21:  true, // int2
+	23:  true, // int4
+	26:  true, // oid
 	700: true, // float4
 	701: true, // float8
 }
@@ -270,8 +279,8 @@ func describeResultOIDs(buf []byte) (oids []uint32, errText string) {
 	}
 	return
 }
-func executeMessage() []byte        { return frame('E', append([]byte{0}, 0, 0, 0, 0)) } // portal="", maxRows=0
-func syncMessage() []byte           { return frame('S', nil) }
+func executeMessage() []byte { return frame('E', append([]byte{0}, 0, 0, 0, 0)) } // portal="", maxRows=0
+func syncMessage() []byte    { return frame('S', nil) }
 
 // frame prefixes a payload with a message type byte and int32 length.
 func frame(typ byte, payload []byte) []byte {

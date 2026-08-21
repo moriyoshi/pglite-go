@@ -188,3 +188,52 @@ func TestDriverTransaction(t *testing.T) {
 		t.Errorf("after commit bal = %d, want 250", got)
 	}
 }
+
+// TestDriverPersistence covers the default (non-ephemeral) mode: a cluster is
+// created, persisted to a host dir on close, then reopened and read back. It
+// specifically guards the warm-restart path where a user table's pages are read
+// from disk rather than shared buffers — the case that must not hang (see the
+// io_method=sync note in wire.go).
+func TestDriverPersistence(t *testing.T) {
+	persist := t.TempDir()
+	dsn := "dir=" + wasmDir(t) + " persist=" + persist
+
+	// Cold: create + insert, then close (persists to the host dir).
+	db, err := sql.Open("pglite", dsn)
+	if err != nil {
+		t.Fatalf("cold open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec("CREATE TABLE kv (id int primary key, v text)"); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO kv VALUES (1,'a'), (2,'b')"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("cold close: %v", err)
+	}
+
+	// Warm: reopen the persisted cluster and read the user table back.
+	db2, err := sql.Open("pglite", dsn)
+	if err != nil {
+		t.Fatalf("warm open: %v", err)
+	}
+	db2.SetMaxOpenConns(1)
+	defer db2.Close()
+
+	var n int
+	if err := db2.QueryRow("SELECT count(*) FROM kv").Scan(&n); err != nil {
+		t.Fatalf("warm count: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("warm count(*) = %d, want 2", n)
+	}
+	var v string
+	if err := db2.QueryRow("SELECT v FROM kv WHERE id = 2").Scan(&v); err != nil {
+		t.Fatalf("warm select: %v", err)
+	}
+	if v != "b" {
+		t.Errorf("warm v = %q, want \"b\"", v)
+	}
+}

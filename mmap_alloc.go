@@ -1,6 +1,6 @@
 //go:build wazero && (darwin || linux)
 
-package main
+package pglite
 
 import (
 	"context"
@@ -20,10 +20,6 @@ func withMemoryAllocator(ctx context.Context) context.Context {
 //     the whole linear memory — the dominant execution cost otherwise), and
 //   - pages are demand-committed by the OS, so RSS tracks actual usage rather
 //     than the 2GB reservation.
-//
-// Profiled: ~65-73% of a grow-heavy query was MemoryInstance.Grow -> memmove;
-// this allocator removes it without the eager-commit cost of
-// WithMemoryCapacityFromMax (which regressed the initdb PoC to ~3.4GB RSS).
 type mmapAllocator struct{}
 
 func (mmapAllocator) Allocate(capBytes, maxBytes uint64) experimental.LinearMemory {

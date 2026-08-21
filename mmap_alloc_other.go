@@ -1,6 +1,6 @@
 //go:build wazero && !darwin && !linux
 
-package main
+package pglite
 
 import "context"
 

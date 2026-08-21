@@ -12,12 +12,11 @@
 # `loadPackage({files:[...]})` metadata embedded in dist/pglite.js. We extract
 # that array and emit it as JSON (see vfs.LoadManifest / vfs.ManifestEntry).
 #
-# Usage:   ./scripts/update-wasm.sh
-#          PGLITE_VERSION=0.4.2 ./scripts/update-wasm.sh
+# Usage:   ./scripts/update-wasm.sh                  # latest published release
+#          PGLITE_VERSION=0.4.2 ./scripts/update-wasm.sh   # pin a version
 set -euo pipefail
 
-PGLITE_VERSION="${PGLITE_VERSION:-0.4.2}"
-TARBALL_URL="https://registry.npmjs.org/@electric-sql/pglite/-/pglite-${PGLITE_VERSION}.tgz"
+REGISTRY="https://registry.npmjs.org/@electric-sql/pglite"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
@@ -29,6 +28,20 @@ for tool in curl tar python3; do
         exit 1
     fi
 done
+
+# Default to the latest published release (npm's "latest" dist-tag) unless pinned.
+if [[ -z "${PGLITE_VERSION:-}" ]]; then
+    echo "Resolving latest @electric-sql/pglite release..."
+    PGLITE_VERSION=$(curl -fsSL "${REGISTRY}/latest" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+    if [[ -z "$PGLITE_VERSION" ]]; then
+        echo "error: could not resolve latest version from npm registry" >&2
+        exit 1
+    fi
+    echo "  latest is ${PGLITE_VERSION}"
+fi
+
+TARBALL_URL="${REGISTRY}/-/pglite-${PGLITE_VERSION}.tgz"
 
 mkdir -p "$WASM_DIR"
 

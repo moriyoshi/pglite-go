@@ -41,12 +41,12 @@ history (runtime benchmarks, the wire-protocol reverse-engineering, perf work).
 - The PGlite **wasm assets**. Fetch them once:
 
   ```sh
-  ./scripts/update-wasm.sh        # downloads @electric-sql/pglite@0.4.2 -> ./wasm
+  ./scripts/update-wasm.sh        # latest @electric-sql/pglite -> ./wasm
   ```
 
   This writes `pglite.wasm`, `initdb.wasm`, `pglite.manifest.json`, and `pglite.data`
-  into `wasm/` (set `PGLITE_VERSION` to pin a different release). Point the
-  driver/library at that directory.
+  into `wasm/`. It fetches the latest published release by default; set
+  `PGLITE_VERSION` to pin a specific one. Point the driver/library at that directory.
 
 ## Usage
 
@@ -124,18 +124,23 @@ On an idle x86-64 Mac (see `JOURNAL.md` for methodology):
   arrive as text strings, which `Scan` converts as usual. Binary applies to
   parameterized (extended-protocol) queries; plain `Query` uses the text protocol.
 - **No `COPY` / `LISTEN`/`NOTIFY` yet.**
-- **CGo required.** The wire-protocol library runs on wasmtime (CGo). A pure-Go
-  `-tags wazero` build exists (`cmd/pglite-poc`) but uses an older single-user query
-  path and does **not** include this driver/library.
+- **CGo by default; pure-Go optional.** The default build runs on wasmtime (CGo).
+  A pure-Go build (`-tags wazero`, `CGO_ENABLED=0`) runs the **same** library and
+  wire protocol on the [wazero](https://github.com/tetratelabs/wazero) runtime — no
+  driver/feature differences — but is considerably slower (notably a ~5 min cold
+  compile of `pglite.wasm`; warm starts are cached). `database/sql` support still
+  needs CGo, since the driver depends on it only through the default backend.
 
 ## Layout
 
 ```
 .                     pglite package — Open/Query/Exec/QueryParams (the library)
+                      backend_wasmtime.go / backend_wazero.go select the runtime
 pgdriver/             database/sql driver, registered as "pglite"
-emscripten/           Emscripten + WASI host layer (wasmtime backend, syscalls, wire hooks)
+emscripten/           Emscripten + WASI host layer + wire hooks
+                      wasmtime_port.go (default) / wazero_port.go (-tags wazero)
 vfs/                  in-memory virtual filesystem
-cmd/pglite/           demo using the library
+cmd/pglite/           demo using the library (builds on both backends)
 scripts/update-wasm.sh     fetches/refreshes the vendored PGlite wasm assets
 ```
 
