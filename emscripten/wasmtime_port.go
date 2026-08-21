@@ -643,6 +643,77 @@ func (rt *WTRuntime) RegisterInitdbCallbacks(cb *InitdbCallbacks) (uint32, error
 	return base, nil
 }
 
+// RWCallbacks are the PGlite socket read/write hooks. Read fills dst with
+// client→server bytes (non-blocking; returns the count, possibly 0). Write
+// receives a copy of server→client bytes.
+type RWCallbacks struct {
+	Read  func(dst []byte) int
+	Write func(src []byte)
+}
+
+// RegisterRWCallbacks places the read/write callbacks into the shared table and
+// returns the base index; pass base+0 (read) and base+1 (write) to
+// pgl_set_rw_cbs. The callbacks operate directly on guest memory.
+func (rt *WTRuntime) RegisterRWCallbacks(cb RWCallbacks) (uint32, error) {
+	base := uint32(rt.table.Size(rt.store))
+	if _, err := rt.table.Grow(rt.store, 2, wasmtime.ValFuncref(nil)); err != nil {
+		return 0, fmt.Errorf("grow table: %w", err)
+	}
+	i32 := wasmtime.NewValType(wasmtime.KindI32)
+	ft := wasmtime.NewFuncType([]*wasmtime.ValType{i32, i32}, []*wasmtime.ValType{i32})
+
+	mem := func(caller *wasmtime.Caller) []byte {
+		if e := caller.GetExport("memory"); e != nil {
+			return e.Memory().UnsafeData(caller)
+		}
+		return rt.memory.UnsafeData(caller)
+	}
+	readFn := wasmtime.NewFunc(rt.store, ft, func(caller *wasmtime.Caller, args []wasmtime.Val) ([]wasmtime.Val, *wasmtime.Trap) {
+		ptr, max := uint32(args[0].I32()), uint32(args[1].I32())
+		data := mem(caller)
+		n := 0
+		if int(ptr) <= len(data) {
+			end := ptr + max
+			if end > uint32(len(data)) {
+				end = uint32(len(data))
+			}
+			n = cb.Read(data[ptr:end])
+		}
+		return []wasmtime.Val{wasmtime.ValI32(int32(n))}, nil
+	})
+	writeFn := wasmtime.NewFunc(rt.store, ft, func(caller *wasmtime.Caller, args []wasmtime.Val) ([]wasmtime.Val, *wasmtime.Trap) {
+		ptr, length := uint32(args[0].I32()), uint32(args[1].I32())
+		data := mem(caller)
+		if int(ptr)+int(length) <= len(data) {
+			cb.Write(data[ptr : ptr+length])
+		}
+		return []wasmtime.Val{wasmtime.ValI32(int32(length))}, nil
+	})
+	for i, fn := range []*wasmtime.Func{readFn, writeFn} {
+		if err := rt.table.Set(rt.store, uint64(base)+uint64(i), wasmtime.ValFuncref(fn)); err != nil {
+			return 0, fmt.Errorf("table.Set %d: %w", base+uint32(i), err)
+		}
+	}
+	return base, nil
+}
+
+// CallExportRaw calls an exported function and reports whether it trapped with
+// the Emscripten longjmp sentinel (so the caller can invoke PostgresMainLongJmp
+// and continue), distinguishing that from a real error.
+func (rt *WTRuntime) CallExportRaw(name string, args ...interface{}) (res interface{}, longjmp bool, err error) {
+	f := rt.instance.GetFunc(rt.store, name)
+	if f == nil {
+		return nil, false, fmt.Errorf("export %q not found", name)
+	}
+	res, err = f.Call(rt.store, args...)
+	if err != nil {
+		if t, ok := err.(*wasmtime.Trap); ok && strings.Contains(t.Message(), longjmpSentinel) {
+			return nil, true, nil
+		}
+	}
+	return res, false, err
+}
+
 // ApplyDataRelocs runs __wasm_apply_data_relocs if the module exports it.
 func (rt *WTRuntime) ApplyDataRelocs(_ context.Context) error {
 	f := rt.instance.GetFunc(rt.store, "__wasm_apply_data_relocs")

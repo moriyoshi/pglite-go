@@ -5,22 +5,19 @@
 // host layer and an in-memory VFS.
 //
 // A DB is a cluster: Open initializes (or loads a persisted) data directory,
-// keeps it in an in-memory filesystem, and starts one persistent single-user
-// PostgreSQL backend. Exec/Query feed statements to that live backend, so
-// session state — the current transaction, temp tables, SET, prepared
-// statements — persists across calls: BEGIN in one Query and COMMIT in a later
-// one form a single transaction. For the standard Go database API, use the
-// registered "pglite" database/sql driver (package pgdriver).
+// keeps it in an in-memory filesystem, and starts one persistent PostgreSQL
+// backend driven over the v3 wire protocol (PGlite's pgl_set_rw_cbs +
+// PostgresMainLoopOnce). Query/Exec feed protocol messages to that live backend,
+// so results carry column type OIDs and command tags (RowsAffected), and session
+// state — the current transaction, temp tables, SET, prepared statements —
+// persists across calls: BEGIN in one Query and COMMIT in a later one form a
+// single transaction. QueryParams runs a real server-side prepared statement
+// (extended protocol). For the standard Go database API, use the registered
+// "pglite" database/sql driver (package pgdriver).
 //
 // The backend is a single connection (as in PGlite itself), so concurrent use
 // must be serialized — the DB does this internally, and database/sql callers
 // should set db.SetMaxOpenConns(1).
-//
-// Current limits vs the PostgreSQL wire protocol: bind parameters are
-// interpolated client-side (via the driver), values arrive as text, and
-// RowsAffected/command tags are not reported by the single-user backend. The
-// planned upgrade is the PGlite wire-protocol bridge (pgl_set_rw_cbs) for
-// server-side prepared statements and typed binary results.
 package pglite
 
 import (
@@ -28,6 +25,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -68,7 +66,7 @@ type DB struct {
 	fs          *vfs.FS
 	persistDir  string
 	database    string
-	sess        *session   // persistent single-user backend
+	wire        *wireConn  // persistent wire-protocol backend
 	mu          sync.Mutex // serializes backend invocations
 }
 
@@ -137,13 +135,13 @@ func Open(cfg Config) (*DB, error) {
 		}
 	}
 
-	// Start the persistent backend so session state (transactions, temp tables,
-	// SET, prepared statements) survives across queries.
-	sess, err := db.startSession()
+	// Start the persistent wire-protocol backend so session state (transactions,
+	// temp tables, SET, prepared statements) survives across queries.
+	wire, err := db.startWire()
 	if err != nil {
 		return nil, fmt.Errorf("start backend: %w", err)
 	}
-	db.sess = sess
+	db.wire = wire
 	return db, nil
 }
 
@@ -166,9 +164,11 @@ func (db *DB) syncLocked() error {
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.sess != nil {
-		db.sess.close()
-		db.sess = nil
+	if db.wire != nil {
+		// Flush committed data to the VFS heap files before persisting.
+		db.wire.simpleQuery("CHECKPOINT")
+		db.wire.close()
+		db.wire = nil
 	}
 	err := db.syncLocked()
 	if db.engine != nil {
@@ -184,6 +184,11 @@ func (db *DB) runCmd(ctx context.Context, args []string, stdin []byte, stdoutCap
 	if err != nil {
 		return -1, err
 	}
+	// Keep the library quiet: initdb subcommands are chatty on stdout/stderr.
+	if stdoutCapture == nil {
+		rt.SetStdout(io.Discard)
+	}
+	rt.SetStderr(io.Discard)
 	if err := rt.ApplyDataRelocs(ctx); err != nil {
 		return -1, err
 	}

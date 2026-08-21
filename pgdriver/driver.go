@@ -13,11 +13,12 @@
 //	persist=<path>    host dir to persist the cluster (default: user cache dir)
 //	ephemeral=true    keep the cluster only in memory
 //
-// The backend is a single, persistent connection, so real transactions work
-// (db.Begin/tx.Commit/tx.Rollback) — but callers must serialize access with
-// db.SetMaxOpenConns(1). Bind parameters ($1, $2, …) are interpolated
-// client-side with proper escaping; values arrive as text and RowsAffected is
-// not reported (single-user backend limitation).
+// Queries run over the PostgreSQL wire protocol against one persistent backend,
+// so bind parameters ($1, $2, …) are real server-side prepared statements
+// (extended protocol), RowsAffected comes from the command tag, and
+// transactions work (db.Begin/tx.Commit/tx.Rollback). The backend is a single
+// connection (as in PGlite), so callers must serialize access with
+// db.SetMaxOpenConns(1). Result values are decoded from their text encodings.
 package pgdriver
 
 import (
@@ -109,12 +110,21 @@ type tx struct{ c *conn }
 func (t *tx) Commit() error   { _, err := t.c.db.Exec("COMMIT"); return err }
 func (t *tx) Rollback() error { _, err := t.c.db.Exec("ROLLBACK"); return err }
 
-func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	q, err := interpolate(query, args)
+func (c *conn) run(query string, args []driver.NamedValue) (*pglite.Rows, error) {
+	if len(args) == 0 {
+		return c.db.Query(query)
+	}
+	params, isNull, err := encodeParams(args)
 	if err != nil {
 		return nil, err
 	}
-	r, err := c.db.Query(q)
+	// The query keeps its $N placeholders; params bind server-side (extended
+	// protocol = a real prepared statement).
+	return c.db.QueryParams(query, params, isNull)
+}
+
+func (c *conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	r, err := c.run(query, args)
 	if err != nil {
 		return nil, err
 	}
@@ -122,14 +132,11 @@ func (c *conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 }
 
 func (c *conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	q, err := interpolate(query, args)
+	r, err := c.run(query, args)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := c.db.Query(q); err != nil {
-		return nil, err
-	}
-	return result{}, nil
+	return result{affected: r.AffectedRows}, nil
 }
 
 type stmt struct {
@@ -154,14 +161,14 @@ func named(vs []driver.Value) []driver.NamedValue {
 	return out
 }
 
-// result reports unknown affected rows (the single-user backend does not emit a
-// command tag). LastInsertId is unsupported (PostgreSQL has no such concept).
-type result struct{}
+// result carries the affected-row count from the CommandComplete tag.
+// LastInsertId is unsupported (PostgreSQL has no such concept).
+type result struct{ affected int64 }
 
 func (result) LastInsertId() (int64, error) {
 	return 0, fmt.Errorf("pglite: LastInsertId is not supported")
 }
-func (result) RowsAffected() (int64, error) { return 0, nil }
+func (r result) RowsAffected() (int64, error) { return r.affected, nil }
 
 type rows struct {
 	r   *pglite.Rows
@@ -237,66 +244,44 @@ func hexNibble(c byte) (byte, error) {
 	return 0, fmt.Errorf("bad nibble")
 }
 
-// interpolate substitutes $1,$2,… placeholders with escaped SQL literals, since
-// the single-user backend has no server-side parameter binding.
-func interpolate(query string, args []driver.NamedValue) (string, error) {
-	if len(args) == 0 {
-		return query, nil
-	}
-	byOrd := make(map[int]driver.Value, len(args))
+// encodeParams renders bind arguments (ordered by $N) as their PostgreSQL text
+// encodings for the extended-protocol Bind message; a nil value becomes NULL.
+func encodeParams(args []driver.NamedValue) (params []string, isNull []bool, err error) {
+	ordered := make([]driver.Value, len(args))
 	for _, a := range args {
-		byOrd[a.Ordinal] = a.Value
+		if a.Ordinal < 1 || a.Ordinal > len(args) {
+			return nil, nil, fmt.Errorf("pglite: bad parameter ordinal %d", a.Ordinal)
+		}
+		ordered[a.Ordinal-1] = a.Value
 	}
-	var b strings.Builder
-	for i := 0; i < len(query); i++ {
-		if query[i] != '$' || i+1 >= len(query) || query[i+1] < '1' || query[i+1] > '9' {
-			b.WriteByte(query[i])
-			continue
+	params = make([]string, len(ordered))
+	isNull = make([]bool, len(ordered))
+	for i, v := range ordered {
+		switch x := v.(type) {
+		case nil:
+			isNull[i] = true
+		case int64:
+			params[i] = strconv.FormatInt(x, 10)
+		case float64:
+			params[i] = strconv.FormatFloat(x, 'g', -1, 64)
+		case bool:
+			if x {
+				params[i] = "t"
+			} else {
+				params[i] = "f"
+			}
+		case string:
+			params[i] = x
+		case []byte:
+			params[i] = `\x` + toHex(x) // bytea text input
+		case time.Time:
+			params[i] = x.Format("2006-01-02 15:04:05.999999-07")
+		default:
+			return nil, nil, fmt.Errorf("pglite: unsupported argument type %T", v)
 		}
-		j := i + 1
-		for j < len(query) && query[j] >= '0' && query[j] <= '9' {
-			j++
-		}
-		ord, _ := strconv.Atoi(query[i+1 : j])
-		v, ok := byOrd[ord]
-		if !ok {
-			return "", fmt.Errorf("pglite: missing argument for $%d", ord)
-		}
-		lit, err := literal(v)
-		if err != nil {
-			return "", err
-		}
-		b.WriteString(lit)
-		i = j - 1
 	}
-	return b.String(), nil
+	return params, isNull, nil
 }
-
-func literal(v driver.Value) (string, error) {
-	switch x := v.(type) {
-	case nil:
-		return "NULL", nil
-	case int64:
-		return strconv.FormatInt(x, 10), nil
-	case float64:
-		return strconv.FormatFloat(x, 'g', -1, 64), nil
-	case bool:
-		if x {
-			return "TRUE", nil
-		}
-		return "FALSE", nil
-	case []byte:
-		return `'\x` + toHex(x) + `'::bytea`, nil
-	case string:
-		return quote(x), nil
-	case time.Time:
-		return quote(x.Format("2006-01-02 15:04:05.999999-07")), nil
-	default:
-		return "", fmt.Errorf("pglite: unsupported argument type %T", v)
-	}
-}
-
-func quote(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 
 func toHex(b []byte) string {
 	const hexdig = "0123456789abcdef"

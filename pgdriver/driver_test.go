@@ -42,6 +42,16 @@ func TestDriverCRUD(t *testing.T) {
 	exec("INSERT INTO t VALUES ($1,$2,$3,$4)", 1, "alice", 9.5, true)
 	exec("INSERT INTO t VALUES ($1,$2,$3,$4)", 2, "bob", nil, false)
 
+	// RowsAffected comes from the wire CommandComplete tag.
+	res, err := db.Exec("UPDATE t SET active = true")
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if n, _ := res.RowsAffected(); n != 2 {
+		t.Errorf("UPDATE RowsAffected = %d, want 2", n)
+	}
+	exec("UPDATE t SET active = false WHERE id = 2") // restore for the checks below
+
 	rows, err := db.Query("SELECT id, name, score, active FROM t ORDER BY id")
 	if err != nil {
 		t.Fatalf("query: %v", err)

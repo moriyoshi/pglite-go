@@ -543,13 +543,40 @@ attributes omitted**, so values are keyed by column index. The driver maps type
 OIDs to Go types (int2/4/8→int64, float4/8→float64, bool→bool, bytea→[]byte, else
 string) and interpolates `$N` params client-side. `jmoiron/sqlx` works unchanged.
 
-**Remaining limits vs the wire protocol:** bind params are client-side interpolated
-(not server-side prepared), values arrive as text, and `RowsAffected`/command tags
-aren't reported (the debug format emits none). **Upgrade path:** the PGlite
-wire-protocol bridge (`pgl_set_rw_cbs`) for server-side prepared statements, typed
-binary results, and RowsAffected. Note: no Asyncify in this build, so a persistent
-*wire* session would use the same parked-on-stdin/read trick this session already
-proves out; the remaining unknown is the exact startup/connect message sequence.
+## Wire protocol — full parity (2026-08-21)
+
+Replaced the single-user backend with the **PostgreSQL v3 wire protocol** via
+PGlite's own mechanism (`wire.go`), closing the remaining gaps. Reverse-engineered
+from the PGlite 0.4.2 npm glue (the JS that drives *our* exact wasm):
+
+- **Setup:** `pgl_set_rw_cbs(read, write)` → `pgl_setPGliteActive(1)` →
+  `callMain(["--single","-F","-O","-j","-c","search_path=public", …, "-D", dir, db])`
+  → `pgl_startPGlite()`. In PGlite mode `main()` finishes startup then "returns" via
+  exit/longjmp while the backend **stays alive** — so the non-nil error from callMain
+  is expected and ignored (cost an hour: I first treated it as fatal).
+- **Drive (no Asyncify!):** stage a wire message; the backend's read callback is
+  **non-blocking** (returns available bytes or 0), so just pump `PostgresMainLoopOnce`
+  until the input is consumed and `pq_buffer_remaining_data()==0`, then
+  `PostgresSendReadyForQueryIfNecessary` + `pgl_pq_flush`. The write callback captures
+  the response, which is decoded. The StartupMessage (`msg[0]==0`) is handled via
+  `pgl_getMyProcPort()` + `ProcessStartupPacket`.
+- **Callbacks** are placed in the shared table (`RegisterRWCallbacks`, like the initdb
+  bridge); longjmp during a pump is caught (`CallExportRaw`) and recovered with
+  `PostgresMainLongJmp`.
+- **Gotcha:** wire mode loads `pg_hba.conf` (single-user never does), whose default
+  `127.0.0.1/32` CIDRs need `getaddrinfo` (stubbed out here). Fixed by writing an
+  IP-free `local/host all all trust` hba before startup.
+
+**Now decoded from the wire:** RowDescription (name + type OID), DataRow (with NULL),
+CommandComplete (**command tag + RowsAffected**), ErrorResponse, ReadyForQuery (txn
+status). The driver uses the **extended protocol** (Parse/Bind/Describe/Execute/Sync)
+for `$N` params — real server-side prepared statements, no client-side interpolation.
+
+**Parity with PGlite (query path): complete** — typed results, RowsAffected, command
+tags, server-side prepared statements, transactions, temp tables/SET, all on one
+persistent backend. Verified via `cmd/wire-probe` and the `pgdriver` tests (`-race`):
+CRUD, `UPDATE`→RowsAffected=2, params, NULL, Begin/Commit/Rollback. Remaining niceties
+(not blocking): binary result formats and COPY.
 
 ## Timeline
 
@@ -579,6 +606,6 @@ proves out; the remaining unknown is the exact startup/connect message sequence.
 | Library API (pglite package) | Done |
 | database/sql driver + sqlx | Done (typed rows, params, NULL) |
 | Persistent session + real transactions | Done (cross-call BEGIN/COMMIT/ROLLBACK, -race clean) |
-| Wire protocol (pgl_set_rw_cbs) | Not started (upgrade for prepared stmts/binary/RowsAffected) |
+| Wire protocol (pgl_set_rw_cbs) | Done — typed results, RowsAffected, server-side prepared stmts |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |
