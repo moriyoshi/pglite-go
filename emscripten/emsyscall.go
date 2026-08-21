@@ -3,6 +3,7 @@ package emscripten
 import (
 	"context"
 	"encoding/binary"
+	"path"
 	"time"
 
 	"github.com/tetratelabs/wazero/api"
@@ -101,7 +102,10 @@ func (h *SyscallHandler) resolvePathAt(mem api.Memory, dirfd int32, pathPtr uint
 	if dirfd == vfs.AT_FDCWD {
 		return p // will be resolved relative to cwd by the VFS
 	}
-	// TODO: resolve relative to dirfd
+	// Resolve relative to the directory referenced by dirfd.
+	if of, ok := h.FS.GetFD(dirfd); ok && of.Path != "" {
+		return path.Join(of.Path, p)
+	}
 	return p
 }
 
