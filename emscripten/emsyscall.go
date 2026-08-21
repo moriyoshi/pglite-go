@@ -3,7 +3,6 @@ package emscripten
 import (
 	"context"
 	"encoding/binary"
-	"fmt"
 	"time"
 
 	"github.com/tetratelabs/wazero/api"
@@ -205,7 +204,7 @@ func (h *SyscallHandler) syscallStat64() api.GoModuleFunc {
 		p := readCStringFromMem(mod.Memory(), pathPtr)
 		node, err := h.FS.Stat(p)
 		if err != nil {
-			fmt.Printf("[syscall] stat64(%q, pathPtr=0x%x) -> ENOENT\n", p, pathPtr)
+			tracef("[syscall] stat64(%q, pathPtr=0x%x) -> ENOENT\n", p, pathPtr)
 			stack[0] = api.EncodeI32(-ENOENT)
 			return
 		}
@@ -240,7 +239,7 @@ func (h *SyscallHandler) syscallNewfstatat() api.GoModuleFunc {
 		p := h.resolvePathAt(mod.Memory(), dirfd, pathPtr)
 		node, err := h.FS.Stat(p)
 		if err != nil {
-			fmt.Printf("[syscall] newfstatat(%s) -> ENOENT\n", p)
+			tracef("[syscall] newfstatat(%s) -> ENOENT\n", p)
 			stack[0] = api.EncodeI32(-ENOENT)
 			return
 		}

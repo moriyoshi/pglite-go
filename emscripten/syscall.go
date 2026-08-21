@@ -15,6 +15,16 @@ import (
 	"github.com/moriyoshi/pglite-go/vfs"
 )
 
+// Trace enables the host layer's debug logging (syscall/runtime traces). Off by
+// default so the package is quiet when used as a library; set to true to debug.
+var Trace = false
+
+func tracef(format string, a ...any) {
+	if Trace {
+		fmt.Printf(format, a...)
+	}
+}
+
 const (
 	// Values matching PGlite's Emscripten build output.
 	// These are extracted from the JS glue code (pglite.js).
@@ -227,7 +237,7 @@ func createHostFunc(name string, sig funcSig) api.GoModuleFunc {
 		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
 			getNowCount++
 			if getNowCount <= 3 || getNowCount%10000 == 0 {
-				fmt.Printf("[emscripten_get_now] call #%d\n", getNowCount)
+				tracef("[emscripten_get_now] call #%d\n", getNowCount)
 			}
 			stack[0] = api.EncodeF64(float64(time.Now().UnixMicro()) / 1000.0)
 		})
@@ -266,7 +276,7 @@ func createHostFunc(name string, sig funcSig) api.GoModuleFunc {
 	case "exit":
 		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
 			code := api.DecodeU32(stack[0])
-			fmt.Printf("[emscripten] exit(%d) called\n", code)
+			tracef("[emscripten] exit(%d) called\n", code)
 			panic(fmt.Sprintf("exit(%d)", code))
 		})
 	case "_emscripten_runtime_keepalive_clear":
@@ -371,7 +381,7 @@ func createHostFunc(name string, sig funcSig) api.GoModuleFunc {
 		return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
 			which := api.DecodeI32(stack[0])
 			timeout := api.DecodeF64(stack[1])
-			fmt.Printf("[setitimer] which=%d timeout=%f\n", which, timeout)
+			tracef("[setitimer] which=%d timeout=%f\n", which, timeout)
 			stack[0] = 0
 		})
 	case "getaddrinfo":
@@ -395,7 +405,7 @@ func makeStub(name string, sig funcSig) api.GoModuleFunc {
 	return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
 		hostCallCounter++
 		if hostCallCounter%100000 == 0 {
-			fmt.Printf("[host] %d calls, last stub: %s\n", hostCallCounter, name)
+			tracef("[host] %d calls, last stub: %s\n", hostCallCounter, name)
 		}
 		for i := range sig.results {
 			stack[len(sig.params)+i] = 0

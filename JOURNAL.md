@@ -4,6 +4,24 @@
 
 Embed PostgreSQL in Go by running [PGlite](https://github.com/electric-sql/pglite) (PostgreSQL compiled to WASM via Emscripten) on a WebAssembly runtime, with a hand-written Emscripten + WASI host layer and an in-memory VFS.
 
+**Now usable as a library + `database/sql` driver:**
+
+```go
+import (
+    "database/sql"
+    _ "github.com/moriyoshi/pglite-go/pgdriver"
+)
+db, _ := sql.Open("pglite", "dir=./wasm database=template1")
+db.SetMaxOpenConns(1)
+db.Exec("CREATE TABLE t (id int, name text)")
+db.Exec("INSERT INTO t VALUES ($1,$2)", 1, "alice")
+rows, _ := db.Query("SELECT id, name FROM t")
+// jmoiron/sqlx works unchanged — it wraps any database/sql driver.
+```
+
+Or the lower-level package API: `pglite.Open(Config) (*DB)` → `db.Query(sql) (*Rows)` / `db.Exec`.
+See "Library & database/sql driver" below for design and limits.
+
 **Runtime: wasmtime is the primary/default path** (fastest compile + execution, only healthy Go binding); [wazero](https://github.com/tetratelabs/wazero) (pure Go, no CGo) is the fallback behind `-tags wazero`. Build/run:
 
 ```
@@ -483,6 +501,43 @@ DB + query" path is now:
 | warm, `.cwasm` but re-initdb | 1.49s |
 | **fully warm (`.cwasm` + skip initdb)** | **0.20s** |
 
+## Library & database/sql driver (2026-08-21)
+
+Turned the demo into a reusable library plus a `database/sql` driver.
+
+**Packages**
+- `pglite` (root): `Open(Config) (*DB, error)`, `(*DB).Query/Exec/Raw/Sync/Close`.
+  A `DB` is one cluster held in the in-memory VFS; Open runs initdb on first use
+  and loads-and-skips-initdb after. Query execution is mutex-serialized (the WASM
+  backend is single-threaded and the cluster is shared).
+- `pgdriver`: registers the `"pglite"` `database/sql` driver. DSN is `key=value`
+  pairs (`dir=`, `database=`, `persist=`, `ephemeral=`). `cmd/pglite` is now a thin
+  consumer of the library.
+
+**How a query runs (single-user backend).** Each `Query`/`Exec` runs a fresh
+`postgres --single` backend over the *shared* VFS cluster, so data written by one
+statement is visible to the next (CREATE→INSERT→SELECT across separate backend
+processes all hit the same on-disk catalog/heap files in the VFS). Results are
+parsed from the backend's `debugtup` output — a descriptor block (column names +
+type OIDs) then one `\t----`-delimited block per tuple, with **NULL attributes
+omitted**, so values are keyed by column index. The driver maps type OIDs to Go
+types (int2/4/8→int64, float4/8→float64, bool→bool, bytea→[]byte, else string) and
+interpolates `$N` bind params client-side with proper escaping. `jmoiron/sqlx`
+works unchanged (it wraps `database/sql`). Verified end-to-end (`pgdriver` test +
+sqlx StructScan/Get/parameterized WHERE, typed scans, NULL).
+
+**Limits (single-user v1):** each Query/Exec is autocommit — a transaction can't
+span calls (`Begin` is unsupported; wrap multiple statements in one `BEGIN; …;
+COMMIT;` call). Bind params are client-side interpolated, not server-side prepared.
+`RowsAffected` is 0 (the debug format emits no command tag). Values arrive as text.
+
+**Upgrade path:** the PGlite wire-protocol bridge (`pgl_set_rw_cbs`, exported by
+pglite.wasm) would give real sessions, server-side prepared statements, typed
+binary results, and RowsAffected. Note: no Asyncify in this build, so the backend
+can't suspend across host calls — the wire path is necessarily a per-batch model
+(startup + queries → captured responses per invocation); the exact
+startup/connect driving sequence needs PGlite's JS glue to reverse-engineer.
+
 ## Timeline
 
 | Milestone | Status |
@@ -508,6 +563,8 @@ DB + query" path is now:
 | wasmedge full execution port | Not started (feasibility proven; large CGo effort) |
 | wasmtime execution port: postgres -V runs | Done (1.5s compile+instantiate+run) |
 | wasmtime full initdb + SELECT 1+1 | Done (2.93s total vs wazero ~11s) |
-| Wire protocol (pgl_set_rw_cbs) | Not started |
+| Library API (pglite package) | Done |
+| database/sql driver + sqlx | Done (typed rows, params, NULL) |
+| Wire protocol (pgl_set_rw_cbs) | Not started (single-user backend used for v1) |
 | `database/sql` driver interface | Not started |
 | VFS persistence | Not started |

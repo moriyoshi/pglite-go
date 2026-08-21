@@ -196,7 +196,7 @@ func (w *wasiImpl) environGet() api.GoModuleFunc {
 		if len(vars) == 0 {
 			vars = defaultEnvVars()
 		}
-		fmt.Printf("[environ_get] writing %d vars\n", len(vars))
+		tracef("[environ_get] writing %d vars\n", len(vars))
 		bufOffset := environBufPtr
 		for i, v := range vars {
 			// Write pointer to the env string
@@ -482,7 +482,7 @@ func (w *wasiImpl) fdPwrite() api.GoModuleFunc {
 func (w *wasiImpl) procExit() api.GoModuleFunc {
 	return api.GoModuleFunc(func(ctx context.Context, mod api.Module, stack []uint64) {
 		code := api.DecodeU32(stack[0])
-		fmt.Printf("[wasi] proc_exit(%d)\n", code)
+		tracef("[wasi] proc_exit(%d)\n", code)
 		panic(fmt.Sprintf("proc_exit(%d)", code))
 	})
 }

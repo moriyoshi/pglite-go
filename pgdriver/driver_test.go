@@ -1,0 +1,86 @@
+//go:build !wazero
+
+package pgdriver_test
+
+import (
+	"database/sql"
+	"os"
+	"path/filepath"
+	"testing"
+
+	_ "github.com/moriyoshi/pglite-go/pgdriver"
+)
+
+// wasmDir locates the repo's wasm assets relative to this package.
+func wasmDir(t *testing.T) string {
+	dir := filepath.Join("..", "wasm")
+	if _, err := os.Stat(filepath.Join(dir, "pglite.wasm")); err != nil {
+		t.Skipf("wasm assets not found at %s (run scripts/download-wasm.sh): %v", dir, err)
+	}
+	abs, _ := filepath.Abs(dir)
+	return abs
+}
+
+// TestDriverCRUD exercises the "pglite" database/sql driver end to end:
+// DDL, parameterized inserts, typed scanning, and NULL handling — all against
+// one in-memory cluster shared across statements.
+func TestDriverCRUD(t *testing.T) {
+	db, err := sql.Open("pglite", "dir="+wasmDir(t)+" ephemeral=true")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	defer db.Close()
+
+	exec := func(q string, args ...any) {
+		t.Helper()
+		if _, err := db.Exec(q, args...); err != nil {
+			t.Fatalf("exec %q: %v", q, err)
+		}
+	}
+	exec("CREATE TABLE t (id int primary key, name text, score float8, active bool)")
+	exec("INSERT INTO t VALUES ($1,$2,$3,$4)", 1, "alice", 9.5, true)
+	exec("INSERT INTO t VALUES ($1,$2,$3,$4)", 2, "bob", nil, false)
+
+	rows, err := db.Query("SELECT id, name, score, active FROM t ORDER BY id")
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	type row struct {
+		id     int
+		name   string
+		score  sql.NullFloat64
+		active bool
+	}
+	var got []row
+	for rows.Next() {
+		var r row
+		if err := rows.Scan(&r.id, &r.name, &r.score, &r.active); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+
+	if len(got) != 2 {
+		t.Fatalf("got %d rows, want 2", len(got))
+	}
+	if got[0] != (row{1, "alice", sql.NullFloat64{Float64: 9.5, Valid: true}, true}) {
+		t.Errorf("row0 = %+v", got[0])
+	}
+	if got[1].id != 2 || got[1].name != "bob" || got[1].score.Valid || got[1].active {
+		t.Errorf("row1 = %+v (want id=2 name=bob score=NULL active=false)", got[1])
+	}
+
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM t WHERE active = $1", true).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("count(active) = %d, want 1", n)
+	}
+}
