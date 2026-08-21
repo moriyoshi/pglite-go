@@ -5,6 +5,7 @@ package pglite
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	emcompat "github.com/moriyoshi/pglite-go/emscripten"
@@ -47,6 +48,9 @@ func (db *DB) runInitdb(ctx context.Context, initdbWasm, postgresWasm []byte) er
 	if err != nil {
 		return fmt.Errorf("runtime: %w", err)
 	}
+	// Keep the library quiet: initdb prints progress to stdout/stderr.
+	rt.SetStdout(io.Discard)
+	rt.SetStderr(io.Discard)
 	if err := rt.ApplyDataRelocs(ctx); err != nil {
 		return fmt.Errorf("relocs: %w", err)
 	}
