@@ -48,13 +48,13 @@ func main() {
 		case ty.MemoryType() != nil:
 			mt := ty.MemoryType()
 			kind = "memory"
-			max, ok := mt.Maximum()
-			detail = fmt.Sprintf("min=%d max=%d(%v)", mt.Minimum(), max, ok)
+			hasMax, max := mt.Maximum()
+			detail = fmt.Sprintf("min=%d max=%d(present=%v)", mt.Minimum(), max, hasMax)
 		case ty.TableType() != nil:
 			tt := ty.TableType()
 			kind = "table"
-			max, ok := tt.Maximum()
-			detail = fmt.Sprintf("%v min=%d max=%d(%v)", tt.Element().Kind(), tt.Minimum(), max, ok)
+			hasMax, max := tt.Maximum()
+			detail = fmt.Sprintf("%v min=%d max=%d(present=%v)", tt.Element().Kind(), tt.Minimum(), max, hasMax)
 		}
 		rows = append(rows, row{imp.Module(), name, kind, detail})
 	}
