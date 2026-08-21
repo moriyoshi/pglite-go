@@ -150,10 +150,6 @@ type wasiImpl struct {
 	envVars   []string
 	stdinData []byte
 	stdinPos  int
-	// stdinReader, if non-nil, backs fd 0 with a streaming reader whose Read may
-	// block. This keeps a single-user backend parked between statements (a
-	// persistent session). Takes precedence over stdinData.
-	stdinReader io.Reader
 	// StdoutOverride, if non-nil, captures stdout instead of writing to stdout
 	StdoutOverride *[]byte
 }
@@ -282,32 +278,8 @@ func (w *wasiImpl) fdRead() api.GoModuleFunc {
 		nreadPtr := api.DecodeU32(stack[3])
 
 		if fd == 0 {
-			// Streaming stdin (persistent session): one blocking Read into the
-			// first iovec that has space. io.EOF yields a 0-length read (EOF to
-			// the guest). Iterating matters because the guest may pass a
-			// zero-length iovec first.
-			if w.stdinReader != nil {
-				for i := uint32(0); i < iovsLen; i++ {
-					bufPtr, _ := mod.Memory().ReadUint32Le(iovsPtr + i*8)
-					bufLen, _ := mod.Memory().ReadUint32Le(iovsPtr + i*8 + 4)
-					if bufLen == 0 {
-						continue
-					}
-					tmp := make([]byte, bufLen)
-					n, _ := w.stdinReader.Read(tmp) // may block until input or EOF
-					if n > 0 {
-						mod.Memory().Write(bufPtr, tmp[:n])
-					}
-					mod.Memory().WriteUint32Le(nreadPtr, uint32(n))
-					stack[0] = wasiSuccess
-					return
-				}
-				// All iovecs were zero-length.
-				mod.Memory().WriteUint32Le(nreadPtr, 0)
-				stack[0] = wasiSuccess
-				return
-			}
-			// Read from stdinData if available
+			// Read from stdinData if available (used by the initdb --boot
+			// subcommand, which is fed its bootstrap SQL on stdin).
 			if w.stdinData != nil && w.stdinPos < len(w.stdinData) {
 				totalRead := uint32(0)
 				for i := uint32(0); i < iovsLen && w.stdinPos < len(w.stdinData); i++ {
