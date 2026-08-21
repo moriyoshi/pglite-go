@@ -48,7 +48,7 @@ history (runtime benchmarks, the wire-protocol reverse-engineering, perf work).
 
   `go generate` runs a small Go fetcher (`internal/fetchwasm`, no shell/python deps) that
   downloads the version this library targets (`pglite.PgliteVersion`); set `PGLITE_VERSION`
-  for a deliberate bump. The legacy `./scripts/update-wasm.sh` still works.
+  for a deliberate bump.
 
   Then choose how the binary gets the assets:
 
@@ -153,7 +153,7 @@ emscripten/           Emscripten + WASI host layer + wire hooks
                       wasmtime_port.go (default) / wazero_port.go (-tags wazero)
 vfs/                  in-memory virtual filesystem
 cmd/pglite/           demo using the library (builds on both backends)
-scripts/update-wasm.sh     fetches/refreshes the vendored PGlite wasm assets
+internal/fetchwasm/   `go generate` fetcher: pulls the PGlite wasm assets from jsDelivr
 ```
 
 ## Credits

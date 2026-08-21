@@ -869,7 +869,7 @@ extraction), `internal/fetchwasm/main.go` (CLI), `generate.go` (`//go:generate`)
 `assets.go` (`resolveWasmFS`/`downloadAssets`/`PgliteVersion`), `assets_embed.go` /
 `assets_noembed.go`. Changed: `pglite.go` (`Config.WasmFS`/`Download`, `fs.FS`-based load),
 `bundlefs.go` (`loadBundleFS(fs.FS)`), `pgdriver/driver.go` (`download` DSN key), `README.md`.
-The legacy `scripts/update-wasm.sh` is kept but superseded by `go generate`.
+The legacy `scripts/update-wasm.sh` was removed — `go generate` (the Go fetcher) replaces it.
 
 ## Timeline
 
