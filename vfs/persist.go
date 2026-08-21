@@ -2,25 +2,28 @@ package vfs
 
 import (
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 )
 
-// SaveSubtree mirrors the VFS subtree rooted at vfsPath onto the host
-// filesystem at hostDir. Regular files, directories and symlinks are
-// preserved along with their permission bits. hostDir is created if absent.
+// SaveSubtree mirrors the VFS subtree rooted at vfsPath onto the host filesystem
+// at hostDir. Regular files, directories and symlinks are preserved along with
+// their permission bits. hostDir is created if absent. The data directory lives
+// entirely in the writable upper layer, so this walks the upper node tree.
 //
-// This is used to persist the initdb-created data directory so that initdb
-// (the dominant startup cost) runs only once per data directory rather than
-// on every process start.
-func (fs *FS) SaveSubtree(vfsPath, hostDir string) error {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+// This is used to persist the initdb-created data directory so that initdb (the
+// dominant startup cost) runs only once per data directory rather than on every
+// process start.
+func (v *FS) SaveSubtree(vfsPath, hostDir string) error {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 
-	root := fs.lookupNoFollow(fs.resolve(vfsPath))
-	if root == nil {
+	root, ok := v.inUpper(v.resolve(vfsPath))
+	if !ok {
 		return fmt.Errorf("SaveSubtree: %s not found in VFS", vfsPath)
 	}
 	if root.Type != FileTypeDirectory {
@@ -34,12 +37,12 @@ func (fs *FS) SaveSubtree(vfsPath, hostDir string) error {
 	if err := os.MkdirAll(hostDir, 0o700); err != nil {
 		return fmt.Errorf("SaveSubtree: mkdir %s: %w", hostDir, err)
 	}
-	return fs.saveNode(root, hostDir)
+	return v.saveNode(root, hostDir)
 }
 
 // saveNode writes the children of a directory node into hostDir. Must hold the
 // read lock.
-func (fs *FS) saveNode(dir *Node, hostDir string) error {
+func (v *FS) saveNode(dir *Node, hostDir string) error {
 	// Deterministic order keeps on-disk output stable across runs.
 	names := make([]string, 0, len(dir.Children))
 	for name := range dir.Children {
@@ -59,7 +62,7 @@ func (fs *FS) saveNode(dir *Node, hostDir string) error {
 			if err := os.MkdirAll(target, 0o700); err != nil {
 				return fmt.Errorf("mkdir %s: %w", target, err)
 			}
-			if err := fs.saveNode(child, target); err != nil {
+			if err := v.saveNode(child, target); err != nil {
 				return err
 			}
 		case FileTypeRegular:
@@ -75,98 +78,75 @@ func (fs *FS) saveNode(dir *Node, hostDir string) error {
 				return fmt.Errorf("symlink %s: %w", target, err)
 			}
 		}
+		// fileTypeWhiteout entries are internal and never persisted.
 	}
 	return nil
 }
 
-// LoadSubtree mirrors a host directory (previously written by SaveSubtree) back
-// into the VFS subtree rooted at vfsPath. Existing VFS entries under vfsPath are
-// left in place unless overwritten by a host entry of the same name.
-func (fs *FS) LoadSubtree(hostDir, vfsPath string) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
+// LoadSubtree materializes an fs.FS (previously written by SaveSubtree, wrapped
+// with os.DirFS) into the writable upper layer at vfsPath. Existing VFS entries
+// under vfsPath are left in place unless overwritten by a source entry of the
+// same name.
+func (v *FS) LoadSubtree(src fs.FS, vfsPath string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
 
-	vfsPath = fs.resolve(vfsPath)
-	if err := fs.mkdirAllLocked(vfsPath, 0o700); err != nil {
-		return fmt.Errorf("LoadSubtree: mkdir %s: %w", vfsPath, err)
+	base := v.resolve(vfsPath)
+	if _, err := v.upper.mkdirAll(relName(base), 0o700); err != nil {
+		return fmt.Errorf("LoadSubtree: mkdir %s: %w", base, err)
 	}
 
-	entries, err := os.ReadDir(hostDir)
-	if err != nil {
-		return fmt.Errorf("LoadSubtree: read %s: %w", hostDir, err)
-	}
-	for _, e := range entries {
-		if err := fs.loadEntry(filepath.Join(hostDir, e.Name()), path.Join(vfsPath, e.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// loadEntry loads a single host path into the VFS at vfsPath. Must hold the
-// write lock.
-func (fs *FS) loadEntry(hostPath, vfsPath string) error {
-	info, err := os.Lstat(hostPath)
-	if err != nil {
-		return fmt.Errorf("lstat %s: %w", hostPath, err)
-	}
-
-	parent := fs.lookup(path.Dir(vfsPath))
-	if parent == nil || parent.Type != FileTypeDirectory {
-		return fmt.Errorf("loadEntry: parent of %s missing", vfsPath)
-	}
-	base := path.Base(vfsPath)
-
-	switch {
-	case info.Mode()&os.ModeSymlink != 0:
-		target, err := os.Readlink(hostPath)
+	return fs.WalkDir(src, ".", func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return fmt.Errorf("readlink %s: %w", hostPath, err)
+			return fmt.Errorf("LoadSubtree: walk %s: %w", p, err)
 		}
-		parent.Children[base] = &Node{
-			Name:    base,
-			Type:    FileTypeSymlink,
-			Target:  target,
-			Parent:  parent,
-			Mode:    0o777,
-			ModTime: info.ModTime(),
+		if p == "." {
+			return nil
 		}
-	case info.IsDir():
-		node, ok := parent.Children[base]
-		if !ok || node.Type != FileTypeDirectory {
-			node = &Node{
-				Name:     base,
-				Type:     FileTypeDirectory,
-				Children: make(map[string]*Node),
-				Parent:   parent,
-				// Normalize to 0700: a valid, strict PostgreSQL data-dir mode.
-				Mode:    0o700,
-				ModTime: info.ModTime(),
+		abs := path.Join(base, p)
+		info, err := d.Info()
+		if err != nil {
+			return fmt.Errorf("LoadSubtree: stat %s: %w", p, err)
+		}
+		switch {
+		case d.Type()&fs.ModeSymlink != 0:
+			target, err := fs.ReadLink(src, p)
+			if err != nil {
+				return fmt.Errorf("LoadSubtree: readlink %s: %w", p, err)
 			}
-			parent.Children[base] = node
-		}
-		entries, err := os.ReadDir(hostPath)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", hostPath, err)
-		}
-		for _, e := range entries {
-			if err := fs.loadEntry(filepath.Join(hostPath, e.Name()), path.Join(vfsPath, e.Name())); err != nil {
+			if _, err := v.upper.place(relName(abs), &Node{
+				Type:    FileTypeSymlink,
+				Target:  target,
+				Mode:    0o777,
+				ModTime: info.ModTime(),
+			}); err != nil {
+				return err
+			}
+		case d.IsDir():
+			// Normalize to 0700: a valid, strict PostgreSQL data-dir mode.
+			if _, err := v.upper.mkdirAll(relName(abs), 0o700); err != nil {
+				return err
+			}
+		default:
+			f, err := src.Open(p)
+			if err != nil {
+				return fmt.Errorf("LoadSubtree: open %s: %w", p, err)
+			}
+			data := make([]byte, info.Size())
+			n, rerr := io.ReadFull(f, data)
+			f.Close()
+			if rerr != nil && rerr != io.EOF && rerr != io.ErrUnexpectedEOF {
+				return fmt.Errorf("LoadSubtree: read %s: %w", p, rerr)
+			}
+			if _, err := v.upper.place(relName(abs), &Node{
+				Type:    FileTypeRegular,
+				Data:    data[:n],
+				Mode:    0o600,
+				ModTime: info.ModTime(),
+			}); err != nil {
 				return err
 			}
 		}
-	default:
-		data, err := os.ReadFile(hostPath)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", hostPath, err)
-		}
-		parent.Children[base] = &Node{
-			Name:    base,
-			Type:    FileTypeRegular,
-			Data:    data,
-			Parent:  parent,
-			Mode:    0o600,
-			ModTime: info.ModTime(),
-		}
-	}
-	return nil
+		return nil
+	})
 }

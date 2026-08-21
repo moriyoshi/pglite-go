@@ -23,6 +23,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -34,9 +35,19 @@ import (
 // Config configures a DB. The zero value is usable: it looks for wasm assets in
 // "./wasm", persists the cluster under the user cache dir, and uses template1.
 type Config struct {
-	// WasmDir holds pglite.wasm, initdb.wasm, pglite.manifest.json, pglite.data.
-	// Defaults to "wasm".
+	// WasmFS, if set, supplies the wasm artifacts (pglite.wasm, initdb.wasm,
+	// pglite.data, pglite.manifest.json) from any io/fs — e.g. a caller-provided
+	// embed.FS. Takes precedence over WasmDir. See resolveWasmFS for the full
+	// source-selection order.
+	WasmFS fs.FS
+	// WasmDir holds the wasm artifacts on the host filesystem. Used when WasmFS
+	// is nil. Empty falls back to embedded assets (-tags embed), then "./wasm",
+	// then an on-demand download when Download is set.
 	WasmDir string
+	// Download allows fetching the pinned artifacts from the jsDelivr CDN into the
+	// user cache dir when no local/embedded source is available. Off by default so
+	// Open never performs surprise network I/O.
+	Download bool
 	// PersistDir is the host directory the initialized cluster is saved to and
 	// loaded from. Empty uses the user cache dir; set Ephemeral to disable.
 	PersistDir string
@@ -66,11 +77,12 @@ type DB struct {
 
 // Open initializes or loads a cluster and returns a ready DB.
 func Open(cfg Config) (*DB, error) {
-	if cfg.WasmDir == "" {
-		cfg.WasmDir = "wasm"
-	}
 	if cfg.Database == "" {
 		cfg.Database = "template1"
+	}
+	wasmFS, err := cfg.resolveWasmFS()
+	if err != nil {
+		return nil, err
 	}
 	db := &DB{cfg: cfg, database: cfg.Database}
 	if !cfg.Ephemeral {
@@ -84,17 +96,18 @@ func Open(cfg Config) (*DB, error) {
 		}
 	}
 
-	db.fs = vfs.New()
-	if err := db.fs.LoadManifest(cfg.WasmDir+"/pglite.manifest.json", cfg.WasmDir+"/pglite.data"); err != nil {
+	lower, err := loadBundleFS(wasmFS)
+	if err != nil {
 		return nil, fmt.Errorf("load manifest: %w", err)
 	}
+	db.fs = vfs.New(lower)
 	db.fs.MkdirAll(dataDir, 0o700)
 	db.fs.MkdirAll("/dev", 0o755)
 	db.fs.WriteFile("/dev/null", nil, 0o666)
 	db.fs.WriteFile("/dev/urandom", nil, 0o666)
 	db.fs.MkdirAll("/home/web_user", 0o755)
 
-	postgresWasm, err := os.ReadFile(cfg.WasmDir + "/pglite.wasm")
+	postgresWasm, err := fs.ReadFile(wasmFS, "pglite.wasm")
 	if err != nil {
 		return nil, fmt.Errorf("read pglite.wasm: %w", err)
 	}
@@ -108,11 +121,11 @@ func Open(cfg Config) (*DB, error) {
 	// Ensure a cluster exists: load a persisted one, else initdb (+persist).
 	ctx := context.Background()
 	if db.persistDir != "" && isPersistedCluster(db.persistDir) {
-		if err := db.fs.LoadSubtree(db.persistDir, dataDir); err != nil {
+		if err := db.fs.LoadSubtree(os.DirFS(db.persistDir), dataDir); err != nil {
 			return nil, fmt.Errorf("load persisted cluster: %w", err)
 		}
 	} else {
-		initdbWasm, err := os.ReadFile(cfg.WasmDir + "/initdb.wasm")
+		initdbWasm, err := fs.ReadFile(wasmFS, "initdb.wasm")
 		if err != nil {
 			return nil, fmt.Errorf("read initdb.wasm: %w", err)
 		}

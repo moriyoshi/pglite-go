@@ -2,6 +2,7 @@ package vfs
 
 import (
 	"bytes"
+	"os"
 	"testing"
 )
 
@@ -11,7 +12,7 @@ import (
 // with its data intact. This guards against the bug where host files inherited
 // a non-readable VFS mode and could not be read back.
 func TestSaveLoadRoundTrip(t *testing.T) {
-	src := New()
+	src := New(nil)
 	src.MkdirAll("/data/base/1", 0o700)
 	src.MkdirAll("/data/global", 0o750)
 	src.MkdirAll("/data/pg_replslot", 0o700) // empty dir must survive
@@ -27,9 +28,9 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 		t.Fatalf("SaveSubtree: %v", err)
 	}
 
-	dst := New()
+	dst := New(nil)
 	dst.MkdirAll("/data", 0o700)
-	if err := dst.LoadSubtree(host, "/data"); err != nil {
+	if err := dst.LoadSubtree(os.DirFS(host), "/data"); err != nil {
 		t.Fatalf("LoadSubtree: %v", err)
 	}
 

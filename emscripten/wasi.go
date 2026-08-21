@@ -432,26 +432,24 @@ func (w *wasiImpl) fdPread() api.GoModuleFunc {
 		offset := int64(stack[3])
 		nreadPtr := api.DecodeU32(stack[4])
 
-		// Save current position, seek, read, restore
-		oldPos, _ := w.fs.Seek(fd, 0, 1) // SEEK_CUR
-		w.fs.Seek(fd, offset, 0)         // SEEK_SET
-
+		// Positioned reads via ReadAt on the file handle — no seek dance.
 		totalRead := uint32(0)
+		pos := offset
 		for i := uint32(0); i < iovsLen; i++ {
 			bufPtr, _ := mod.Memory().ReadUint32Le(iovsPtr + i*8)
 			bufLen, _ := mod.Memory().ReadUint32Le(iovsPtr + i*8 + 4)
 			readBuf := make([]byte, bufLen)
-			n, _ := w.fs.Read(fd, readBuf)
+			n, _ := w.fs.Pread(fd, readBuf, pos)
 			if n > 0 {
 				mod.Memory().Write(bufPtr, readBuf[:n])
 			}
 			totalRead += uint32(n)
+			pos += int64(n)
 			if n < int(bufLen) {
 				break
 			}
 		}
 
-		w.fs.Seek(fd, oldPos, 0) // restore
 		mod.Memory().WriteUint32Le(nreadPtr, totalRead)
 		stack[0] = wasiSuccess
 	})
@@ -465,10 +463,9 @@ func (w *wasiImpl) fdPwrite() api.GoModuleFunc {
 		offset := int64(stack[3])
 		nwrittenPtr := api.DecodeU32(stack[4])
 
-		oldPos, _ := w.fs.Seek(fd, 0, 1)
-		w.fs.Seek(fd, offset, 0)
-
+		// Positioned writes via WriteAt on the file handle — no seek dance.
 		totalWritten := uint32(0)
+		pos := offset
 		for i := uint32(0); i < iovsLen; i++ {
 			bufPtr, _ := mod.Memory().ReadUint32Le(iovsPtr + i*8)
 			bufLen, _ := mod.Memory().ReadUint32Le(iovsPtr + i*8 + 4)
@@ -476,11 +473,11 @@ func (w *wasiImpl) fdPwrite() api.GoModuleFunc {
 			if !ok {
 				break
 			}
-			n, _ := w.fs.Write(fd, data)
+			n, _ := w.fs.Pwrite(fd, data, pos)
 			totalWritten += uint32(n)
+			pos += int64(n)
 		}
 
-		w.fs.Seek(fd, oldPos, 0)
 		mod.Memory().WriteUint32Le(nwrittenPtr, totalWritten)
 		stack[0] = wasiSuccess
 	})

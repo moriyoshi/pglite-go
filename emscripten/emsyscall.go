@@ -156,10 +156,10 @@ func writeStat64(mem api.Memory, buf uint32, node *vfs.Node) {
 		size = 4096
 	case vfs.FileTypeRegular:
 		mode = 0o100000 | (node.Mode & 0o7777) // S_IFREG
-		size = uint64(len(node.Data))
+		size = uint64(node.Size())
 	case vfs.FileTypeSymlink:
 		mode = 0o120000 | (node.Mode & 0o7777) // S_IFLNK
-		size = uint64(len(node.Target))
+		size = uint64(node.Size())
 	}
 
 	binary.LittleEndian.PutUint32(statBuf[0:], 1)     // st_dev

@@ -729,6 +729,148 @@ callbacks); `emscripten/wasi.go` (`WASIInstance.SetStdout/SetStderr`);
 `emscripten/wasmtime_port.go` (`RWCallbacks` moved out, interface assertion).
 Removed: `cmd/pglite-poc/`.
 
+## Work Summary — 2026-08-21 (VFS refactored into an io/fs-backed overlay)
+
+Reshaped the `vfs` package from a single in-memory node tree into an **overlay
+filesystem** built on the standard `io/fs` abstraction: a read-only **lower** layer
+(`fs.FS`) stacked under a writable **upper** layer (a `WritableFS`, in-memory by
+default). The overlay owns the cross-cutting state — the open-fd table, cwd, path and
+symlink resolution, copy-up, and whiteouts — while the layers only store bytes.
+
+**Why.** Previously `LoadManifest` copied the whole 6.3 MB / 699-entry install bundle
+into the node tree, so the install lived twice in RAM (the `pglite.data` buffer *and*
+per-entry `Node.Data`). Making the install a lower `fs.FS` lets it be served
+**zero-copy** — each file is a `ReadAt` over a sub-slice of the bundle blob — dropping
+resident memory by roughly the install size. The writable data dir stays in the
+in-memory upper layer, so hot-path read/write speed is unchanged. Each byte now lives
+in exactly one layer, so there is no eager-vs-lazy materialization to schedule.
+
+**The `File` union is the linchpin.** `type File interface { fs.File; io.ReaderAt;
+io.WriterAt; io.Seeker }`. A concrete backing store provides real random access
+through it — the bundle file over a `[]byte`, and (for a future write-through upper)
+`*os.File`, which already satisfies the whole union. This is what defeats the "io/fs is
+streaming-only, so it can't back a random-access DB workload" objection: the interface
+only *guarantees* `fs.File`, but the concrete sources we use implement the full union,
+so `pread`/`pwrite` map straight onto `ReadAt`/`WriteAt`.
+
+**Design decisions (settled with the user, over several iterations):**
+- Overlay with copy-up + whiteouts — *not* eager materialization, *not* a
+  path-partitioned mux. Copy-up/whiteout are correct but effectively cold paths (the
+  install is immutable; PG never writes under `/pglite`).
+- Upper layer behind a `WritableFS` interface so an `os`-dir/write-through impl is
+  possible later, but the **default upper is in-memory**, preserving today's all-in-RAM
+  data dir and `SaveSubtree` persistence.
+- Persisted-cluster reload **loads into the upper** (as before) via
+  `LoadSubtree(os.DirFS(persistDir), dataDir)` — not mounted as a pristine lower.
+- Public `Node`/`FileType`/`OpenFile` surface kept, so the syscall shim is largely
+  untouched; only a few call sites changed (no back-compat shims).
+
+**Findings / gotchas:**
+- `Fstat`/`Stat` must return `*Node` even for lower-backed files, so the overlay
+  **synthesizes** a transient `*Node` from `fs.FileInfo`. Size can't come from
+  `len(Data)` (a lower file's bytes aren't resident), so `Node` gained a `Size()`
+  method (`dataSize` field for synthesized nodes) and `writeStat64` now calls
+  `node.Size()` instead of `len(node.Data)`.
+- The overlay owns the per-fd offset and uses **positioned I/O exclusively**
+  (`handle.ReadAt`/`WriteAt`); `fd_pread`/`fd_pwrite` dropped their save-seek-read-restore
+  dance for new `FS.Pread`/`FS.Pwrite`. `memHandle`'s own offset is only used if a caller
+  drives `Read`/`Seek` through the `File` interface directly.
+- Go **1.25** `fs.ReadLink`/`fs.Lstat`/`fs.ReadLinkFS` make symlinks representable across
+  the boundary; `os.DirFS` implements `ReadLinkFS`, so data-dir symlinks (`pg_wal`, etc.)
+  round-trip. `WalkDir` reports symlinks via `DirEntry.Type()` without following them.
+- `WritableFS` is defined and satisfied by `memFS`, but the overlay uses the concrete
+  `*memFS` for the richer internal ops (raw `Node` access, copy-up). A genuinely
+  pluggable upper would need those ops expressed on the interface — deferred until an
+  `os`-backed upper is actually built.
+- macOS `os.UserCacheDir` **ignores `XDG_CACHE_HOME`** and uses `~/Library/Caches`;
+  isolate persistence tests with an explicit `Config.PersistDir` (a `t.TempDir()`).
+
+**Coupling scan (for "update all consumers").** Only two files carry `vfs` *semantics* —
+`emscripten/emsyscall.go` (path + fd + the `Node`-field reads in `writeStat64`) and
+`emscripten/wasi.go` (fd `Read/Write/Seek`, `GetFD().Path`). The wasmtime port reuses the
+same `wasiImpl`. Everything else (`syscall.go`, both `backend_*.go`, the two runtime
+ports, `wire.go`, `cluster.go`) only threads `*vfs.FS` by pointer or calls `WriteFile`.
+`vfs.O_*` and `Node.Name/Children/Parent`, `OpenFile.Node/Flags` are unreferenced outside
+`vfs/`, so the retained surface is exactly what external code needs.
+
+**Verification.** `go build ./...` clean; `go vet` clean except two *pre-existing* style
+warnings in the untouched `wasmtime_port.go`. `go test ./...` green (vfs round-trip +
+full `pgdriver` database/sql suite). End-to-end: fresh `initdb`+query, then reload
+(initdb skipped); and a stricter run that created a table + row, restarted from the
+persisted dir, and read `42 | overlay` back — proving bundle-lower reads, writable-upper
+writes, `Pread`/`Pwrite`, and the `SaveSubtree`→`os.DirFS`→`LoadSubtree` cycle.
+
+**Files.** New: `vfs/file.go` (the `File` union, `memHandle` with 2× append growth,
+`roBufHandle` fallback, `nodeInfo` → `fs.FileInfo`), `vfs/memfs.go` (in-memory
+`WritableFS` + `Node`/`FileType` + whiteout type), `bundlefs.go` (`bundleFS`: zero-copy
+read-only `fs.FS` over `pglite.data` + manifest, `StatFS`/`ReadDirFS`). Rewritten:
+`vfs/vfs.go` (overlay `FS`, `New(lower fs.FS)`, `Pread`/`Pwrite`), `vfs/persist.go`
+(`LoadSubtree(src fs.FS, …)` via `fs.WalkDir`). Changed: `pglite.go`
+(`vfs.New(loadBundleFS(...))`, `LoadSubtree(os.DirFS(...))`), `emsyscall.go`
+(`node.Size()`), `wasi.go` (pread/pwrite → `Pread`/`Pwrite`), `vfs/persist_test.go`.
+Removed: `vfs.LoadManifest` + `vfs.ManifestEntry` (bundle knowledge moved to
+`bundlefs.go`).
+
+## Work Summary — 2026-08-21 (asset distribution: go-generate fetcher, -tags embed, jsDelivr on-demand)
+
+Built three complementary ways to supply the wasm artifacts (`pglite.wasm` 10 MB,
+`pglite.data` 6.3 MB, `initdb.wasm` 395 KB, `pglite.manifest.json` 82 KB), all funnelled
+through the `fs.FS` seam the VFS refactor introduced. Assets stay **gitignored/untracked**.
+
+**Enabling change: asset loading is now `fs.FS`-driven.** `Config` gained `WasmFS fs.FS`
+and `Download bool`; `loadBundleFS` takes an `fs.FS`; `pglite.go` reads the two `.wasm`
+blobs via `fs.ReadFile(wasmFS, …)`. `resolveWasmFS` picks the source in precedence order:
+`WasmFS` → `WasmDir` → embedded (`-tags embed`) → `./wasm` (if populated) → on-demand
+download (if `Download`). The wasmtime `.cwasm` compile cache keys off the wasm **content
+hash** under `os.UserCacheDir()`, independent of source, so warm starts survive every mode.
+
+**1. Go fetcher (`go generate`).** Ported `scripts/update-wasm.sh` (bash + python + curl +
+tar) to `internal/pgassets` + the `internal/fetchwasm` CLI, wired via
+`//go:generate go run ./internal/fetchwasm`. Key simplification from the user's jsDelivr
+idea: jsDelivr serves the npm package's `dist/` files **individually**, so there's no
+tarball — just four HTTP GETs, no `archive/tar`/`compress/gzip` handling. The manifest is
+still regex-extracted from `dist/pglite.js` (`loadPackage({files:[…],remote_package_size:N`)
+and re-emitted as JSON, byte-for-byte identical to the python output (verified: all four
+files `cmp`-identical to the vendored copies, 699 entries).
+
+**2. `-tags embed`.** `assets_embed.go` (`//go:build embed`) has `//go:embed wasm` +
+`defaultEmbeddedFS()`; `assets_noembed.go` returns nil. A default build never references
+the embed (so `go get` consumers and clean CI still build without the assets); an
+`-tags embed` build after `go generate` bakes them in. Verified: `go build -tags embed
+./cmd/pglite` → 55 MB self-contained binary that runs from an empty dir.
+
+**3. jsDelivr on-demand (`Config.Download`).** Opt-in (off by default so `Open` never does
+surprise network I/O). `downloadAssets` fetches the **pinned** version into
+`UserCacheDir/pglite-go/assets/<ver>/`, staged in a `.tmp` sibling and `os.Rename`d into
+place so a partial fetch never looks complete; a populated cache is a fast no-op. Verified
+end-to-end: from a dir with no `wasm/` and no embed, `Config{Download:true, Ephemeral:true}`
+fetched from jsDelivr, ran `initdb`, and returned `SELECT 1+1 → 2`.
+
+**Findings / decisions:**
+- **Version must be pinned.** The host layer carries version-specific constants (initdb
+  stdout FILE* address, PG18 fd-probe), so `pgassets.Version = "0.5.5"` (exposed as
+  `pglite.PgliteVersion`) is the single source of truth. Both the fetcher default and the
+  runtime download use it; `go generate` fetching "latest" would risk an incompatible bump.
+- **jsDelivr compression gotcha.** A range request reported `pglite.data` as 1.67 MB
+  (~3.7× smaller) while `pglite.js` said `remote_package_size:6293225`. jsDelivr serves
+  these blobs **gzip-compressed on the wire**. Go's `net/http` adds `Accept-Encoding: gzip`
+  itself and transparently decodes → a plain `http.Get` yields the correct 6,293,225
+  uncompressed bytes. The fetcher deliberately leaves `Accept-Encoding` unset (setting it
+  manually would disable auto-decode, and asking for brotli would return bytes Go can't
+  inflate). Content-Length is unreliable under transport gzip, so it `io.ReadAll`s.
+- **`go generate` ≠ build time.** It never runs during `go build`/`go get`/`go install`
+  (Go has no build hooks). So the fetcher helps source builds/CI; it does nothing for a
+  downstream `go install …@latest` consumer — which is exactly the gap `Download` (runtime
+  fetch) and `WasmFS` (consumer-side embed) fill.
+- `pgdriver` DSN gained `download=true`.
+
+**Files.** New: `internal/pgassets/pgassets.go` (shared jsDelivr fetcher + manifest
+extraction), `internal/fetchwasm/main.go` (CLI), `generate.go` (`//go:generate`),
+`assets.go` (`resolveWasmFS`/`downloadAssets`/`PgliteVersion`), `assets_embed.go` /
+`assets_noembed.go`. Changed: `pglite.go` (`Config.WasmFS`/`Download`, `fs.FS`-based load),
+`bundlefs.go` (`loadBundleFS(fs.FS)`), `pgdriver/driver.go` (`download` DSN key), `README.md`.
+The legacy `scripts/update-wasm.sh` is kept but superseded by `go generate`.
+
 ## Timeline
 
 | Milestone | Status |
@@ -763,3 +905,5 @@ Removed: `cmd/pglite-poc/`.
 | ICU "und" collator in initdb post-bootstrap | Open (non-fatal; tests pass) |
 | wazero backend: full wire parity via emcompat.Runtime | Done — one `cmd/pglite` on both backends; poc removed |
 | Warm-start persistence hang on 0.5.5 user-table scans | Open (see memory note; ephemeral works) |
+| VFS refactored into an io/fs-backed overlay (lower fs.FS + writable upper) | Done — zero-copy install, `File` union, `Pread`/`Pwrite`; pgdriver suite green |
+| Asset distribution: go-generate fetcher + `-tags embed` + jsDelivr on-demand | Done — Go fetcher (byte-identical), 55 MB self-contained binary, `Config.Download` verified |

@@ -12,6 +12,7 @@
 //	database=<name>   database to connect to (default "template1")
 //	persist=<path>    host dir to persist the cluster (default: user cache dir)
 //	ephemeral=true    keep the cluster only in memory
+//	download=true     fetch the wasm artifacts from jsDelivr if no local source
 //
 // Queries run over the PostgreSQL wire protocol against one persistent backend,
 // so bind parameters ($1, $2, …) are real server-side prepared statements
@@ -80,6 +81,8 @@ func parseDSN(dsn string) (pglite.Config, error) {
 			cfg.PersistDir = v
 		case "ephemeral":
 			cfg.Ephemeral = v == "true" || v == "1"
+		case "download":
+			cfg.Download = v == "true" || v == "1"
 		default:
 			return cfg, fmt.Errorf("pglite: unknown DSN key %q", k)
 		}

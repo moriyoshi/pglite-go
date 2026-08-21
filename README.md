@@ -38,15 +38,26 @@ history (runtime benchmarks, the wire-protocol reverse-engineering, perf work).
 
 - **Go 1.25+** with **CGo enabled** (the default). `wasmtime-go` vendors a prebuilt
   `libwasmtime`, so there is nothing else to install.
-- The PGlite **wasm assets**. Fetch them once:
+- The PGlite **wasm assets** (`pglite.wasm`, `initdb.wasm`, `pglite.data`,
+  `pglite.manifest.json`). They are not committed; obtain them in whichever way suits
+  your build:
 
   ```sh
-  ./scripts/update-wasm.sh        # latest @electric-sql/pglite -> ./wasm
+  go generate ./...              # fetch the pinned release from jsDelivr -> ./wasm
   ```
 
-  This writes `pglite.wasm`, `initdb.wasm`, `pglite.manifest.json`, and `pglite.data`
-  into `wasm/`. It fetches the latest published release by default; set
-  `PGLITE_VERSION` to pin a specific one. Point the driver/library at that directory.
+  `go generate` runs a small Go fetcher (`internal/fetchwasm`, no shell/python deps) that
+  downloads the version this library targets (`pglite.PgliteVersion`); set `PGLITE_VERSION`
+  for a deliberate bump. The legacy `./scripts/update-wasm.sh` still works.
+
+  Then choose how the binary gets the assets:
+
+  | Approach | How | Trade-off |
+  |----------|-----|-----------|
+  | **Directory** (default) | ship `wasm/` beside the binary, or `WasmDir`/`dir=` | assets on disk at runtime |
+  | **Embed** | `go generate ./... && go build -tags embed` | self-contained binary (+~16 MB) |
+  | **On-demand** | `Config{Download: true}` / `download=true` | no assets shipped; fetches from jsDelivr into the user cache on first run (needs network) |
+  | **Your own `fs.FS`** | `Config{WasmFS: myEmbedFS}` | embed assets you fetched in your own app |
 
 ## Usage
 
@@ -77,6 +88,7 @@ dbx.Select(&users, `SELECT id, name FROM users WHERE active = $1`, true)
 | `database` | database to connect to | `template1` |
 | `persist` | host dir to save/restore the cluster | user cache dir |
 | `ephemeral` | keep the cluster only in memory (`true`) | `false` |
+| `download` | fetch wasm assets from jsDelivr if no local source (`true`) | `false` |
 
 ### Lower-level library
 
