@@ -1,4 +1,4 @@
-//go:build wazero
+//go:build wazero && !aot
 
 package pglite
 
