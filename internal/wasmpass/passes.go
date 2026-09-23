@@ -51,12 +51,36 @@ func DefaultConfig() Config {
 			"pgl_set_pclose_fn": true, "pgl_set_popen_fn": true, "pgl_set_system_fn": true,
 			"__main_argc_argv": true, "__wasm_call_ctors": true, "__wasm_apply_data_relocs": true,
 			"memory": true,
+			// allocators the shared _mmap_js/_munmap_js handlers call back into
+			"emscripten_builtin_memalign": true, "malloc": true,
 		},
 		BaseGlobals: map[string]int32{
 			"__memory_base": 0, "__stack_pointer": 10937088, "__table_base": 0, "__heap_base": 10937088,
 		},
 		SeedImport:       "_emscripten_throw_longjmp",
 		ThrewAddr:        2980948,
+		SPGlobalOverride: -1,
+	}
+}
+
+// DefaultInitdbConfig returns the configuration for initdb.wasm. It differs from
+// pglite in the export roots and the __THREW__ address; the base-global values are
+// the same host-provided constants, and __stack_pointer is import global 0 (vs 1
+// in pglite) — wasmpass derives that automatically for the instrumentation.
+func DefaultInitdbConfig() Config {
+	return Config{
+		Roots: map[string]bool{
+			"__main_argc_argv": true, "__wasm_call_ctors": true, "__wasm_apply_data_relocs": true,
+			"pgl_set_system_fn": true, "pgl_set_popen_fn": true, "pgl_set_pclose_fn": true,
+			"fopen": true, "fclose": true, "fflush": true, "_emscripten_stack_alloc": true,
+			"emscripten_builtin_memalign": true, "malloc": true,
+			"memory": true,
+		},
+		BaseGlobals: map[string]int32{
+			"__memory_base": 0, "__stack_pointer": 10937088, "__table_base": 0, "__heap_base": 10937088,
+		},
+		SeedImport:       "_emscripten_throw_longjmp",
+		ThrewAddr:        139240, // value of the global setThrew loads (initdb global 39; derive per module)
 		SPGlobalOverride: -1,
 	}
 }

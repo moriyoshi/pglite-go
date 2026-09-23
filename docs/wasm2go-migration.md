@@ -220,10 +220,39 @@ Two fixes were needed to get there:
   backends (this is a genuine termination, distinct from the panic-free cooperative
   longjmp).
 
+## Cold init (creating a cluster)
+
+initdb is transpiled too, so the AOT backend can create a cluster from scratch —
+not just warm-load one. `go generate -tags aot` also runs:
+
+```sh
+go run ./cmd/wasmpass -config initdb -i wasm/initdb.wasm -o wasm/initdb.standalone.wasm
+go run github.com/goccy/wasm2go/cmd/wasm2go@latest -i wasm/initdb.standalone.wasm \
+    -import github.com/moriyoshi/pglite-go/internal/initdbwasm -pkg initdbwasm -pure \
+    -o internal/initdbwasm/initdbwasm.go
+go run ./internal/genaot -dir internal/initdbwasm -pkg initdbwasm -kind initdb -sp 0
+```
+
+initdb is small, so wasm2go emits it **single-file** (methods on `*Module`,
+unexported fields, no `base` subpackage) rather than the multi-package split
+pglite gets — `genaot` auto-detects and handles both. Two initdb-specific
+constants: `__stack_pointer` is import global 0 (pglite: 1), and `__THREW__` is at
+a different address (derive it from `setThrew`'s `global.get` per module — the
+global *index* differs between modules). The cold path also needs the module's
+allocator/FILE exports kept (`malloc`, `emscripten_builtin_memalign`, `fopen`,
+`fclose`, `fflush`, `_emscripten_stack_alloc`) because the shared `_mmap_js` and
+initdb-callback handlers call back into them.
+
+**Verified:** `go test -tags aot -run TestAOTColdInit` opens against an *empty*
+persist dir, so Open runs initdb — which spawns `postgres --boot` in fresh AOT
+pgwasm instances over the shared VFS, captures ~1 MB of bootstrap SQL, and writes
+a valid cluster (`pg_control present=true`) — then runs `SELECT 42` -> `42`. Fully
+self-contained pure-Go PostgreSQL: no pre-existing cluster, no CGo, no wasm engine.
+(The `--single` post-bootstrap phase FATALs on the PG18 ICU root-collator issue,
+a pre-existing PGlite quirk unrelated to AOT; the essential catalog still lands.)
+
 ## Status / open items
 
-- End-to-end runtime proof at scale: wire the host `env`+WASI interface to the
-  generated package and drive pglite-go's wire protocol against a wasm2go build.
 - Productionize: share one unwind landing per function (shave the +29% LOC).
 - Alternative (not chosen — no-panic constraint): confined `panic`/`recover` in
   the ~56 host `invoke_*` trampolines only (~2 lines, zero wasm instrumentation).

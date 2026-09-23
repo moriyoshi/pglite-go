@@ -45,6 +45,10 @@ type AOTModule interface {
 	// SP/SetSP read and write the __stack_pointer global (for argv marshaling).
 	SP() int32
 	SetSP(int32)
+	// SetStdout/SetStderr/SetStdoutCapture retarget the VFS-backed WASI streams.
+	SetStdout(io.Writer)
+	SetStderr(io.Writer)
+	SetStdoutCapture(*[]byte)
 }
 
 // aotThrewAddr is the linear-memory address of Emscripten's __THREW__ flag. A
@@ -54,10 +58,7 @@ type AOTModule interface {
 const aotThrewAddr = 2980948
 
 type A2GRuntime struct {
-	mod    AOTModule
-	stdout io.Writer
-	stderr io.Writer
-	stdcap *[]byte
+	mod AOTModule
 }
 
 var _ Runtime = (*A2GRuntime)(nil)
@@ -194,26 +195,30 @@ func (rt *A2GRuntime) RegisterInitdbCallbacks(cb *InitdbCallbacks) (uint32, erro
 	return rt.mod.RegisterInitdb(cb), nil
 }
 
-// FindStdoutFILE locates musl's static __stdout_FILE in guest memory (same scan
-// the engine backends use, over the []byte slice directly).
+// FindStdoutFILE locates musl's static __stdout_FILE in guest memory by its
+// initialized signature (flags=5, fd=1, buf_size=1024, lock=-1) — the same scan
+// the engine backends use, over the []byte directly.
 func (rt *A2GRuntime) FindStdoutFILE() uint32 {
-	// TODO(aot): reuse the exact signature scan from wasmtime_port.go /
-	// wazero_port.go (flags=5, fd=1, buf_size=1024, lock=-1); factor it into a
-	// shared helper taking []byte so all three backends share one implementation.
-	return findStdoutFILEIn(rt.mod.Memory())
-}
-
-func (rt *A2GRuntime) SetStdout(w io.Writer) { rt.stdout = w }
-func (rt *A2GRuntime) SetStderr(w io.Writer) { rt.stderr = w }
-func (rt *A2GRuntime) SetStdoutCapture(buf *[]byte) {
-	// TODO(aot): route fd 1 into buf via the generated WASI stubs
-	// (base.WasiStubs supports redirecting stdout to an io.Writer).
-	rt.stdcap = buf
-}
-
-// findStdoutFILEIn is the shared []byte scan (stub for the sketch).
-func findStdoutFILEIn(mem []byte) uint32 {
-	// TODO(aot): port the musl __stdout_FILE signature scan here.
-	_ = mem
+	mem := rt.mod.Memory()
+	size := uint32(len(mem))
+	const (
+		offFlags   = 0
+		offBufSize = 48
+		offFD      = 60
+		offLock    = 76
+		fileMin    = 84
+	)
+	u32 := func(p uint32) uint32 { return binary.LittleEndian.Uint32(mem[p : p+4]) }
+	i32 := func(p uint32) int32 { return int32(u32(p)) }
+	for p := uint32(0); p+fileMin <= size; p += 4 {
+		if u32(p+offFlags) == 5 && i32(p+offFD) == 1 &&
+			i32(p+offLock) == -1 && i32(p+offBufSize) == 1024 {
+			return p
+		}
+	}
 	return 0
 }
+
+func (rt *A2GRuntime) SetStdout(w io.Writer)        { rt.mod.SetStdout(w) }
+func (rt *A2GRuntime) SetStderr(w io.Writer)        { rt.mod.SetStderr(w) }
+func (rt *A2GRuntime) SetStdoutCapture(buf *[]byte) { rt.mod.SetStdoutCapture(buf) }
