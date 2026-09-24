@@ -106,23 +106,34 @@ AOT-specific; everything else is shared. Cooperative longjmp maps to
 `CallExportRaw` reading (and clearing) `__THREW__` after the top-level call — no
 Go panic/recover.
 
-## Keeping the distributed codebase thin
+## Keeping the distributed codebase thin: the companion module
 
-The transpiled Go is ~14M LOC / ~200 MB — a build artifact, not source:
+The transpiled Go is ~14M LOC / ~200 MB — far too much to carry in this module. It
+lives in a **separate companion module, `github.com/moriyoshi/pglite-go-aot`**, so
+this core module stays thin (the default wasmtime/wazero backends need no generated
+Go at all). AOT is enabled with a `database/sql`-style **driver blank-import**:
 
-1. **Do not commit it** — generate locally (`go generate -tags aot`), exactly as
-   the `.wasm` assets are fetched not committed. The default backends need no
-   generated Go at all. AOT is an opt-in local build (not `go get`-able, since Go
-   does not run generate on install).
-2. **Companion module** (`pglite-go-aot`) if a `go get`-able prebuilt AOT is
-   wanted — versioned per PGlite release, like `goccy/llamawasm2go`.
-3. **Shrink the generated code**: keep `-pure` (the asm backend doubles output);
-   keep tight DCE roots (the 16 entry exports); and have `internal/wasmpass` share
-   one unwind landing per function instead of per-site (attacks the +29%
-   instrumentation LOC).
-4. The 10 MB `pglite.wasm` is the single source of truth for all three backends —
-   runtime backends load it, AOT transpiles it — so the shipped source stays thin
-   regardless of which backends are enabled.
+```go
+import (
+    "github.com/moriyoshi/pglite-go"
+    _ "github.com/moriyoshi/pglite-go-aot" // registers the AOT backend via init()
+)
+// build with -tags aot
+```
+
+The companion imports this module's `emscripten`/`vfs` packages and calls
+`pglite.RegisterAOT(pgwasm.NewAOT, initdbwasm.NewAOT)` from an `init()`. This module
+never imports the companion — so there is **no module cycle**, and `-tags aot`
+compiles here with no generated code present (the constructors are nil until a
+companion registers them; `newRuntimeFrom*` returns a clear error otherwise). The
+companion is regenerated and re-tagged per PGlite release (the `internal/wasmpass`
++ `internal/genaot` tools live here).
+
+Other levers, if the companion itself needs to be smaller: keep `-pure` (the asm
+backend doubles output); keep tight DCE roots; and have `internal/wasmpass` share
+one unwind landing per function instead of per-site (attacks the +29% LOC). The
+10 MB `pglite.wasm` remains the single source of truth for all three backends —
+runtime backends load it, AOT transpiles it.
 
 ## Generated glue (`internal/genaot`)
 
