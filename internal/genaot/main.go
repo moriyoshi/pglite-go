@@ -1,15 +1,17 @@
 // Command genaot emits the AOT glue for a goccy/wasm2go-transpiled PGlite
 // package: the AOTModule shim (NewAOT + the emscripten.AOTModule methods) and
-// the env host adapter (implements base.EnvImports). It reads the generated
-// package's base.go to enumerate the EnvImports methods and writes
-// aot_generated.go into the package directory.
+// the env/WASI host adapter. It reads the transpiled package's interfaces and
+// writes aot_generated.go into the package directory.
+//
+// It handles both wasm2go output shapes:
+//   - multi-package (large modules, e.g. pglite): a base subpackage holds the
+//     Module (exported fields Memory/T0/GN), exports are package funcs
+//     WasmCallCtors(m *base.Module), interfaces live in base/base.go.
+//   - single-file (small modules, e.g. initdb): everything in one package,
+//     unexported fields (memory/t0/gN), exports are methods m.WasmCallCtors(),
+//     interfaces in the top .go file.
 //
 // It is run by `go generate -tags aot` after wasm2go; see docs/wasm2go-migration.md.
-//
-// Usage:
-//
-//	genaot -dir internal/pgwasm -pkg pgwasm \
-//	    -baseimport github.com/moriyoshi/pglite-go/internal/pgwasm/base -kind pglite
 package main
 
 import (
@@ -27,9 +29,8 @@ const (
 	vfsImport        = "github.com/moriyoshi/pglite-go/vfs"
 )
 
-// exportEntry describes how a wasm export name maps to a generated top-package
-// function, for the Call dispatch. argc counts i32 args after the *Module; ret
-// is true if the function returns an i32.
+// exportEntry maps a wasm export name to its generated Go name. argc counts i32
+// args after the receiver; ret is true if it returns an i32.
 type exportEntry struct {
 	goFunc string
 	argc   int
@@ -54,7 +55,53 @@ var pgliteExports = map[string]exportEntry{
 	"PostgresMainLoopOnce":                 {"PostgresMainLoopOnce", 0, false},
 	"PostgresMainLongJmp":                  {"PostgresMainLongJmp", 0, false},
 	"PostgresSendReadyForQueryIfNecessary": {"PostgresSendReadyForQueryIfNecessary", 0, false},
+	// Allocators the shared _mmap_js/_munmap_js handlers call back into.
+	"emscripten_builtin_memalign": {"EmscriptenBuiltinMemalign", 2, true},
+	"malloc":                      {"Malloc", 1, true},
 }
+
+// initdbExports maps the roots runInitdb + InitdbCallbacks call.
+var initdbExports = map[string]exportEntry{
+	"__wasm_call_ctors":           {"WasmCallCtors", 0, false},
+	"__wasm_apply_data_relocs":    {"WasmApplyDataRelocs", 0, false},
+	"__main_argc_argv":            {"MainArgcArgv", 2, true},
+	"pgl_set_system_fn":           {"PglSetSystemFn", 1, false},
+	"pgl_set_popen_fn":            {"PglSetPopenFn", 1, false},
+	"pgl_set_pclose_fn":           {"PglSetPcloseFn", 1, false},
+	"fopen":                       {"Fopen", 2, true},
+	"fclose":                      {"Fclose", 1, true},
+	"fflush":                      {"Fflush", 1, true},
+	"_emscripten_stack_alloc":     {"EmscriptenStackAlloc", 1, true}, // export method mangle strips leading _
+	"emscripten_builtin_memalign": {"EmscriptenBuiltinMemalign", 2, true},
+	"malloc":                      {"Malloc", 1, true},
+}
+
+// layout captures the differences between the two wasm2go output shapes.
+type layout struct {
+	mod     string // Module type name: "base.Module" or "Module"
+	mem     string // memory field: "Memory" or "memory"
+	t0      string // table field: "T0" or "t0"
+	gpre    string // global-field prefix: "G" or "g"
+	memSize string // memSize field: "MemSize" or "memSize"
+	method  bool   // exports are methods on *Module (single-file) vs package funcs (multi)
+	useBase bool   // import the base subpackage
+	ifaceGo string // file to parse interfaces from
+}
+
+func (L layout) modRef() string { return "*" + L.mod }
+
+// entryCall renders a call to a generated export. recv is the module expr
+// ("m" or "a.m"). For method layout it is recv.Name(args); for func layout it is
+// Name(recv, args).
+func (L layout) entryCall(recv, name string, args ...string) string {
+	if L.method {
+		return recv + "." + name + "(" + strings.Join(args, ", ") + ")"
+	}
+	return name + "(" + strings.Join(append([]string{recv}, args...), ", ") + ")"
+}
+
+// baseType rewrites the interface's "*Module" to the layout's module type.
+func (L layout) baseType(t string) string { return strings.ReplaceAll(t, "*Module", "*"+L.mod) }
 
 type method struct {
 	name   string
@@ -65,17 +112,13 @@ type param struct{ name, typ string }
 
 var methodRe = regexp.MustCompile(`^\s*(\w+)\((.*?)\)\s*(\S+)?\s*$`)
 
-func parseEnvImports(baseGo string) []method {
-	return parseInterface(baseGo, "EnvImports")
-}
-
-func parseInterface(baseGo, iface string) []method {
-	src, err := os.ReadFile(baseGo)
+func parseInterface(goFile, iface string) []method {
+	src, err := os.ReadFile(goFile)
 	must(err)
 	s := string(src)
 	i := strings.Index(s, "type "+iface+" interface {")
 	if i < 0 {
-		fatal(iface + " interface not found in " + baseGo)
+		return nil // interface may be absent (e.g. no WASI imports)
 	}
 	body := s[i:]
 	body = body[strings.Index(body, "{")+1:]
@@ -95,9 +138,8 @@ func parseInterface(baseGo, iface string) []method {
 			f := strings.Fields(p)
 			ps = append(ps, param{f[0], strings.Join(f[1:], " ")})
 		}
-		// drop the leading receiver-ish "m *Module"
 		if len(ps) > 0 {
-			ps = ps[1:]
+			ps = ps[1:] // drop the leading "m *Module"
 		}
 		out = append(out, method{mm[1], ps, mm[3]})
 	}
@@ -112,23 +154,60 @@ func splitParams(s string) []string {
 	return strings.Split(s, ",")
 }
 
-func baseType(t string) string { return strings.ReplaceAll(t, "*Module", "*base.Module") }
+// detectLayout inspects the generated package directory.
+func detectLayout(dir, baseImport string) layout {
+	if _, err := os.Stat(filepath.Join(dir, "base", "base.go")); err == nil {
+		return layout{
+			mod: "base.Module", mem: "Memory", t0: "T0", gpre: "G", memSize: "MemSize",
+			method: false, useBase: true,
+			ifaceGo: filepath.Join(dir, "base", "base.go"),
+		}
+	}
+	// single-file: find the .go with the interfaces
+	iface := ""
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if !strings.HasSuffix(e.Name(), ".go") {
+			continue
+		}
+		b, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		if strings.Contains(string(b), "type EnvImports interface {") {
+			iface = filepath.Join(dir, e.Name())
+			break
+		}
+	}
+	if iface == "" {
+		fatal("could not find EnvImports interface in " + dir)
+	}
+	return layout{
+		mod: "Module", mem: "memory", t0: "t0", gpre: "g", memSize: "memSize",
+		method: true, useBase: false,
+		ifaceGo: iface,
+	}
+}
 
 func main() {
 	dir := flag.String("dir", "", "generated top-package directory")
 	pkg := flag.String("pkg", "", "top package name")
-	baseImport := flag.String("baseimport", "", "import path of the base subpackage")
+	baseImport := flag.String("baseimport", "", "import path of the base subpackage (multi-package layout)")
 	kind := flag.String("kind", "pglite", "pglite|initdb")
+	sp := flag.Int("sp", 1, "__stack_pointer global index (pglite=1, initdb=0)")
 	flag.Parse()
-	if *dir == "" || *pkg == "" || *baseImport == "" {
+	if *dir == "" || *pkg == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
-	baseGo := filepath.Join(*dir, "base", "base.go")
-	methods := parseEnvImports(baseGo)
-	// The same host struct also implements the WASI interface, so file I/O routes
-	// through the VFS-backed handlers instead of wasm2go's host-backed DefaultWASI.
-	methods = append(methods, parseInterface(baseGo, "Wasi_snapshot_preview1Imports")...)
+
+	L := detectLayout(*dir, *baseImport)
+	methods := parseInterface(L.ifaceGo, "EnvImports")
+	// The same host struct also implements WASI, so file I/O routes through the
+	// VFS-backed handlers instead of wasm2go's host-backed DefaultWASI.
+	methods = append(methods, parseInterface(L.ifaceGo, "Wasi_snapshot_preview1Imports")...)
+
+	table := pgliteExports
+	if *kind == "initdb" {
+		table = initdbExports
+	}
 
 	var b strings.Builder
 	p := func(f string, a ...any) { fmt.Fprintf(&b, f, a...); b.WriteByte('\n') }
@@ -140,18 +219,21 @@ func main() {
 	p("")
 	p("import (")
 	p("\t%q", "context")
-	p("\tbase %q", *baseImport)
+	p("\t%q", "io")
+	if L.useBase {
+		p("\tbase %q", *baseImport)
+	}
 	p("\temcompat %q", emscriptenImport)
 	p("\t%q", vfsImport)
 	p("\tapi %q", "github.com/tetratelabs/wazero/api")
 	p(")")
 	p("")
 
-	// env host adapter
-	p("// host implements base.EnvImports + base.Wasi_snapshot_preview1Imports. invoke_* trampolines do the indirect")
-	p("// call through the exported table; _emscripten_throw_longjmp is the no-op")
-	p("// cooperative-unwind driver; the syscalls/runtime funcs route through the")
-	p("// shared emscripten handlers via disp.Invoke + the api.Module adapter.")
+	// --- host: implements EnvImports + Wasi_snapshot_preview1Imports ---
+	p("// host implements the env + WASI import interfaces: invoke_* trampolines")
+	p("// call through the table; _emscripten_throw_longjmp is the no-op cooperative")
+	p("// unwind driver; everything else routes through the shared emscripten")
+	p("// handlers via disp.Invoke + the api.Module adapter.")
 	p("type host struct {")
 	p("\tfs      *vfs.FS")
 	p("\tstdin   []byte")
@@ -159,38 +241,39 @@ func main() {
 	p("\tdisp    *emcompat.AOTDispatch")
 	p("}")
 	p("")
-	p("// aotHostModule wraps m as an api.Module for the shared handlers.")
-	p("func (h *host) mod(m *base.Module) api.Module {")
-	p("\treturn emcompat.NewAOTModuleAdapter(func() []byte { return m.Memory }, func(n string, a []uint64) uint64 { return aotCall(m, n, a) })")
+	p("func (h *host) mod(m %s) api.Module {", L.modRef())
+	p("\treturn emcompat.NewAOTModuleAdapter(func() []byte { return m.%s }, func(n string, a []uint64) uint64 { return aotCall(m, n, a) })", L.mem)
 	p("}")
 	p("")
 	for _, m := range methods {
-		emitMethod(p, m)
+		emitMethod(p, L, m)
 	}
 
-	// AOTModule shim
-	p("// aotModule adapts the transpiled *base.Module to emcompat.AOTModule.")
-	p("type aotModule struct{ m *base.Module }")
+	// --- aotModule: implements emcompat.AOTModule ---
+	p("type aotModule struct {")
+	p("\tm    %s", L.modRef())
+	p("\tdisp *emcompat.AOTDispatch")
+	p("}")
 	p("")
-	p("func (a *aotModule) Memory() []byte  { return a.m.Memory }")
-	p("func (a *aotModule) ApplyDataRelocs() { WasmApplyDataRelocs(a.m) }")
-	p("func (a *aotModule) CallCtors()       { WasmCallCtors(a.m) }")
-	p("func (a *aotModule) SP() int32        { return a.m.G1 }") // __stack_pointer
-	p("func (a *aotModule) SetSP(v int32)    { a.m.G1 = v }")
+	p("func (a *aotModule) Memory() []byte { return a.m.%s }", L.mem)
+	p("func (a *aotModule) ApplyDataRelocs() { %s }", L.entryCall("a.m", "WasmApplyDataRelocs"))
+	p("func (a *aotModule) CallCtors() { %s }", L.entryCall("a.m", "WasmCallCtors"))
+	p("func (a *aotModule) SP() int32 { return a.m.%s%d }", L.gpre, *sp)
+	p("func (a *aotModule) SetSP(v int32) { a.m.%s%d = v }", L.gpre, *sp)
+	p("func (a *aotModule) SetStdout(w io.Writer) { a.disp.SetStdout(w) }")
+	p("func (a *aotModule) SetStderr(w io.Writer) { a.disp.SetStderr(w) }")
+	p("func (a *aotModule) SetStdoutCapture(bb *[]byte) { a.disp.SetStdoutCapture(bb) }")
 	p("")
-	emitCall(p, *kind)
-	emitRegisterRW(p)
-	emitRegisterInitdb(p)
+	emitCall(p, L, table)
+	emitRegisterRW(p, L)
+	emitRegisterInitdb(p, L)
 
-	// constructor
-	p("// NewAOT wires the env/WASI host adapter, instantiates the transpiled")
-	p("// module (New uses the built-in DefaultWASI), and returns it as an")
-	p("// emcompat.AOTModule for A2GRuntime to drive.")
+	p("// NewAOT wires the host adapter, instantiates the transpiled module with")
+	p("// headroom for emscripten_resize_heap to grow by reslicing (no realloc,")
+	p("// so cached m.M stays valid), and returns it as an emcompat.AOTModule.")
 	p("func NewAOT(fs *vfs.FS, stdin []byte, capture *[]byte) emcompat.AOTModule {")
 	p("\th := &host{fs: fs, stdin: stdin, capture: capture, disp: emcompat.NewAOTDispatch(fs, stdin, capture)}")
-	p("\t// Reserve headroom so emscripten_resize_heap can grow the heap by")
-	p("\t// reslicing (no realloc → cached m.M stays valid).")
-	p("\treturn &aotModule{m: NewWithWASIReserve(h, h, 768<<20)}")
+	p("\treturn &aotModule{m: NewWithWASIReserve(h, h, 768<<20), disp: h.disp}")
 	p("}")
 	p("")
 	p("func aotI32(v uint64) int32 { return int32(uint32(v)) }")
@@ -200,21 +283,19 @@ func main() {
 	out := filepath.Join(*dir, "aot_generated.go")
 	formatted, err := format.Source([]byte(b.String()))
 	if err != nil {
-		// still write unformatted for debugging
 		_ = os.WriteFile(out, []byte(b.String()), 0o644)
 		fatal(fmt.Sprintf("format: %v (wrote unformatted to %s)", err, out))
 	}
 	must(os.WriteFile(out, formatted, 0o644))
-	fmt.Fprintf(os.Stderr, "genaot: wrote %s (%d EnvImports methods)\n", out, len(methods))
+	fmt.Fprintf(os.Stderr, "genaot: wrote %s (%d import methods, layout method=%v)\n", out, len(methods), L.method)
 }
 
-func emitMethod(p func(string, ...any), m method) {
-	// build signature
+func emitMethod(p func(string, ...any), L layout, m method) {
 	var sig []string
 	for _, pr := range m.params {
-		sig = append(sig, pr.name+" "+baseType(pr.typ))
+		sig = append(sig, pr.name+" "+L.baseType(pr.typ))
 	}
-	params := "m *base.Module"
+	params := "m " + L.modRef()
 	if len(sig) > 0 {
 		params += ", " + strings.Join(sig, ", ")
 	}
@@ -227,29 +308,25 @@ func emitMethod(p func(string, ...any), m method) {
 	case m.name == "X_emscripten_throw_longjmp":
 		p("\t// cooperative unwind: __THREW__ already set; just return")
 	case m.name == "Emscripten_resize_heap":
-		// Grow by reslicing within the pre-reserved cap so the backing array —
-		// and every caller's cached m.M base pointer — stays valid (a realloc
-		// mid-execution would corrupt them).
 		p("\tnewLen := uint64(uint32(%s))", m.params[0].name)
-		p("\tif newLen <= m.MemSize.Load() {")
+		p("\tif newLen <= m.%s.Load() {", L.memSize)
 		p("\t\treturn 1")
 		p("\t}")
-		p("\tif newLen > uint64(cap(m.Memory)) {")
+		p("\tif newLen > uint64(cap(m.%s)) {", L.mem)
 		p("\t\treturn 0")
 		p("\t}")
-		p("\tm.Memory = m.Memory[:newLen]")
-		p("\tm.MemSize.Store(newLen)")
+		p("\tm.%s = m.%s[:newLen]", L.mem, L.mem)
+		p("\tm.%s.Store(newLen)", L.memSize)
 		p("\treturn 1")
 	case strings.HasPrefix(m.name, "Invoke_"):
-		// params[0] = table index; rest = call args
 		idx := m.params[0].name
 		callArgs := m.params[1:]
 		var argTypes, argVals []string
 		for _, a := range callArgs {
-			argTypes = append(argTypes, baseType(a.typ))
+			argTypes = append(argTypes, L.baseType(a.typ))
 			argVals = append(argVals, a.name)
 		}
-		fnsig := "func(*base.Module"
+		fnsig := "func(" + L.modRef()
 		if len(argTypes) > 0 {
 			fnsig += ", " + strings.Join(argTypes, ", ")
 		}
@@ -257,14 +334,13 @@ func emitMethod(p func(string, ...any), m method) {
 		if m.ret != "" {
 			fnsig += " " + m.ret
 		}
-		call := fmt.Sprintf("m.T0[%s].(%s)(m%s)", idx, fnsig, prefixComma(argVals))
+		call := fmt.Sprintf("m.%s[%s].(%s)(m%s)", L.t0, idx, fnsig, prefixComma(argVals))
 		if m.ret != "" {
 			p("\treturn %s", call)
 		} else {
 			p("\t%s", call)
 		}
 	default:
-		// route through the shared host handler via the api.Module adapter
 		np := len(m.params)
 		nr := 0
 		if m.ret != "" {
@@ -320,7 +396,7 @@ func encFor(typ, name string) string {
 func decFor(typ string) string {
 	switch typ {
 	case "int64":
-		return "api.DecodeI64(stack[0])"
+		return "int64(stack[0])" // api has no DecodeI64; the lane is the raw uint64
 	case "float64":
 		return "api.DecodeF64(stack[0])"
 	case "float32":
@@ -340,22 +416,18 @@ func vtByte(typ string) string {
 	return "0x7f"
 }
 
-func emitCall(p func(string, ...any), kind string) {
-	table := pgliteExports
-	if kind == "initdb" {
-		table = map[string]exportEntry{} // TODO(aot): initdb export roots
-	}
+func emitCall(p func(string, ...any), L layout, table map[string]exportEntry) {
 	p("func (a *aotModule) Call(name string, args []uint64) uint64 { return aotCall(a.m, name, args) }")
 	p("")
 	p("// aotCall dispatches an exported function by name (wasm value lanes).")
-	p("func aotCall(m *base.Module, name string, args []uint64) uint64 {")
+	p("func aotCall(m %s, name string, args []uint64) uint64 {", L.modRef())
 	p("\tswitch name {")
 	for name, e := range table {
 		var callArgs []string
 		for i := 0; i < e.argc; i++ {
 			callArgs = append(callArgs, fmt.Sprintf("aotI32(args[%d])", i))
 		}
-		invoke := fmt.Sprintf("%s(m%s)", e.goFunc, prefixComma(callArgs))
+		invoke := L.entryCall("m", e.goFunc, callArgs...)
 		p("\tcase %q:", name)
 		if e.ret {
 			p("\t\treturn uint64(uint32(%s))", invoke)
@@ -371,46 +443,45 @@ func emitCall(p func(string, ...any), kind string) {
 	p("")
 }
 
-func emitRegisterRW(p func(string, ...any)) {
-	p("// RegisterRW appends the socket read/write callbacks to the table and")
-	p("// returns their base index (base+0=read, base+1=write). Signatures match")
-	p("// the wazero backend: (ptr i32, len i32) -> i32.")
+func emitRegisterRW(p func(string, ...any), L layout) {
+	p("// RegisterRW appends the socket read/write callbacks (ptr i32, len i32 -> i32,")
+	p("// matching the wazero backend) and returns the base index.")
 	p("func (a *aotModule) RegisterRW(read func(dst []byte) int, write func(src []byte)) uint32 {")
-	p("\tidx := uint32(len(a.m.T0))")
-	p("\treadFn := func(m *base.Module, ptr, max int32) int32 {")
+	p("\tidx := uint32(len(a.m.%s))", L.t0)
+	p("\treadFn := func(m %s, ptr, max int32) int32 {", L.modRef())
 	p("\t\ttmp := make([]byte, max)")
 	p("\t\tn := read(tmp)")
 	p("\t\tif n > 0 {")
-	p("\t\t\tcopy(m.Memory[ptr:ptr+int32(n)], tmp[:n])")
+	p("\t\t\tcopy(m.%s[ptr:ptr+int32(n)], tmp[:n])", L.mem)
 	p("\t\t}")
 	p("\t\treturn int32(n)")
 	p("\t}")
-	p("\twriteFn := func(m *base.Module, ptr, length int32) int32 {")
-	p("\t\twrite(m.Memory[ptr : ptr+length])")
+	p("\twriteFn := func(m %s, ptr, length int32) int32 {", L.modRef())
+	p("\t\twrite(m.%s[ptr : ptr+length])", L.mem)
 	p("\t\treturn length")
 	p("\t}")
-	p("\ta.m.T0 = append(a.m.T0, readFn, writeFn)")
+	p("\ta.m.%s = append(a.m.%s, readFn, writeFn)", L.t0, L.t0)
 	p("\treturn idx")
 	p("}")
 	p("")
 }
 
-func emitRegisterInitdb(p func(string, ...any)) {
-	p("// RegisterInitdb appends the system/popen/pclose callbacks and returns the")
-	p("// base index. TODO(aot): match the exact table-entry signatures and FILE*")
-	p("// handling from emscripten/systemcb.go; not exercised until the initdb path.")
+func emitRegisterInitdb(p func(string, ...any), L layout) {
+	p("// RegisterInitdb gives the callbacks module access (readCString, Fopen via")
+	p("// exports) and appends the system/popen/pclose table entries.")
 	p("func (a *aotModule) RegisterInitdb(cb *emcompat.InitdbCallbacks) uint32 {")
-	p("\tidx := uint32(len(a.m.T0))")
-	p("\tsystemFn := func(m *base.Module, cmd int32) int32 {")
-	p("\t\treturn cb.OnSystem(context.Background(), aotCStr(m.Memory, cmd))")
+	p("\tcb.SetModule(emcompat.NewAOTModuleAdapter(func() []byte { return a.m.%s }, func(n string, ar []uint64) uint64 { return aotCall(a.m, n, ar) }))", L.mem)
+	p("\tidx := uint32(len(a.m.%s))", L.t0)
+	p("\tsystemFn := func(m %s, cmd int32) int32 {", L.modRef())
+	p("\t\treturn cb.OnSystem(context.Background(), aotCStr(m.%s, cmd))", L.mem)
 	p("\t}")
-	p("\tpopenFn := func(m *base.Module, cmd, mode int32) int32 {")
-	p("\t\treturn cb.OnPopen(context.Background(), aotCStr(m.Memory, cmd), aotCStr(m.Memory, mode))")
+	p("\tpopenFn := func(m %s, cmd, mode int32) int32 {", L.modRef())
+	p("\t\treturn cb.OnPopen(context.Background(), aotCStr(m.%s, cmd), aotCStr(m.%s, mode))", L.mem, L.mem)
 	p("\t}")
-	p("\tpcloseFn := func(m *base.Module, stream int32) int32 {")
+	p("\tpcloseFn := func(m %s, stream int32) int32 {", L.modRef())
 	p("\t\treturn cb.OnPclose(context.Background(), stream)")
 	p("\t}")
-	p("\ta.m.T0 = append(a.m.T0, systemFn, popenFn, pcloseFn)")
+	p("\ta.m.%s = append(a.m.%s, systemFn, popenFn, pcloseFn)", L.t0, L.t0)
 	p("\treturn idx")
 	p("}")
 	p("")
