@@ -1,4 +1,4 @@
-//go:build !wazero
+//go:build !wazero && !aot
 
 // Package emscripten — wasmtime backend (the default).
 //

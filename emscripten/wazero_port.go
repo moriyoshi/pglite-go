@@ -1,4 +1,4 @@
-//go:build wazero
+//go:build wazero && !aot
 
 // Package emscripten — wazero backend (pure Go, no CGo; -tags wazero).
 //
