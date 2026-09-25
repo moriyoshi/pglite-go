@@ -4,6 +4,4 @@ wasm/
 
 # AOT (wasm2go-transpiled) packages are build artifacts (~200MB), produced by
 # `go generate -tags aot`; do not commit. See docs/wasm2go-migration.md.
-/internal/pgwasm/
-/internal/initdbwasm/
 /wasm/pglite.standalone.wasm
