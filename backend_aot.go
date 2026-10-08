@@ -4,10 +4,9 @@ package pglite
 
 import (
 	"context"
+	"errors"
 
 	emcompat "github.com/moriyoshi/pglite-go/emscripten"
-	initdbwasm "github.com/moriyoshi/pglite-go/internal/initdbwasm"
-	pgwasm "github.com/moriyoshi/pglite-go/internal/pgwasm"
 	"github.com/moriyoshi/pglite-go/vfs"
 )
 
@@ -16,18 +15,38 @@ import (
 // the same backend contract as backend_wasmtime.go / backend_wazero.go, so
 // pglite.go / wire.go / cluster.go use it unchanged.
 //
-// The transpiled packages (internal/pgwasm for the postgres module,
-// internal/initdbwasm for initdb) are build artifacts and are NOT committed —
-// treat them like the .wasm assets. Produce them locally with:
+// The ~200 MB of transpiled Go lives in a companion module rather than here, so
+// this module stays thin. That module registers its constructors via a driver
+// pattern (like database/sql) — enable the AOT backend by blank-importing it:
 //
-//	go generate ./...            # fetch pglite.wasm + initdb.wasm  (existing)
-//	go generate -tags aot ./...  # internal/wasmpass + wasm2go -> internal/{pgwasm,initdbwasm}
-//	go build -tags aot ./...
+//	import (
+//	    "github.com/moriyoshi/pglite-go"
+//	    _ "github.com/moriyoshi/pglite-go-aot" // registers the AOT backend
+//	)
+//	// build with -tags aot
 //
-// Each generate step emits, alongside the wasm2go output, a small shim
-// (NewAOT + the AOTModule methods) and the auto-generated env/WASI host adapter
-// that bridges the module's EnvImports to the shared handlers in this package's
-// emscripten/ layer. See docs/wasm2go-migration.md.
+// The companion imports this module's emscripten/vfs packages; this module never
+// imports the companion, so there is no module cycle. See docs/wasm2go-migration.md.
+
+// AOTFactory instantiates a transpiled module over the given VFS/stdin/capture
+// and returns it as an emcompat.AOTModule. The companion module supplies one for
+// the postgres module and one for initdb.
+type AOTFactory func(fs *vfs.FS, stdin []byte, capture *[]byte) emcompat.AOTModule
+
+var (
+	aotPglite AOTFactory
+	aotInitdb AOTFactory
+)
+
+// RegisterAOT installs the transpiled-module constructors. The companion module
+// github.com/moriyoshi/pglite-go-aot calls it from an init(); user code enables
+// the backend by blank-importing that module.
+func RegisterAOT(pglite, initdb AOTFactory) {
+	aotPglite, aotInitdb = pglite, initdb
+}
+
+var errAOTNotRegistered = errors.New(
+	"pglite: AOT backend not registered — blank-import github.com/moriyoshi/pglite-go-aot and build with -tags aot")
 
 // There is no runtime engine to manage in the AOT backend.
 type aotEngine struct{}
@@ -47,17 +66,19 @@ func compileModule(e wasmEngine, wasm []byte, name string) (wasmModule, error) {
 }
 
 // newRuntimeFromModule is the postgres path (pglite.go compiles with name
-// "pglite"), backed by the transpiled internal/pgwasm package.
+// "pglite"), backed by the companion's transpiled postgres module.
 func newRuntimeFromModule(ctx context.Context, e wasmEngine, m wasmModule, fs *vfs.FS, stdin []byte, capture *[]byte) (emcompat.Runtime, error) {
-	// NewAOT (generated shim) wires the env/WASI host adapter over fs/stdin/capture,
-	// instantiates the transpiled module, and returns it as an emcompat.AOTModule.
-	mod := pgwasm.NewAOT(fs, stdin, capture)
-	return emcompat.NewA2GRuntime(ctx, mod)
+	if aotPglite == nil {
+		return nil, errAOTNotRegistered
+	}
+	return emcompat.NewA2GRuntime(ctx, aotPglite(fs, stdin, capture))
 }
 
 // newRuntimeFromWasm is the initdb path (cluster.go). The wasm bytes are ignored;
-// initdb is transpiled into internal/initdbwasm.
+// initdb is transpiled in the companion module.
 func newRuntimeFromWasm(ctx context.Context, e wasmEngine, wasm []byte, fs *vfs.FS, stdin []byte, capture *[]byte) (emcompat.Runtime, error) {
-	mod := initdbwasm.NewAOT(fs, stdin, capture)
-	return emcompat.NewA2GRuntime(ctx, mod)
+	if aotInitdb == nil {
+		return nil, errAOTNotRegistered
+	}
+	return emcompat.NewA2GRuntime(ctx, aotInitdb(fs, stdin, capture))
 }
