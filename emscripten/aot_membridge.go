@@ -132,6 +132,16 @@ func (f *aotFunction) CallWithStack(_ context.Context, stack []uint64) error {
 	return nil
 }
 
+// Definition exposes the export name (some handlers, e.g. _mmap_js, branch on it).
+func (f *aotFunction) Definition() api.FunctionDefinition { return aotFuncDef{name: f.name} }
+
+type aotFuncDef struct {
+	api.FunctionDefinition // nil embed: promotes the sealing marker
+	name                   string
+}
+
+func (d aotFuncDef) Name() string { return d.name }
+
 // NewAOTModuleAdapter returns an api.Module over the transpiled module's live
 // memory accessor and name-dispatched Call, for passing to the shared
 // api.GoModuleFunc handlers.

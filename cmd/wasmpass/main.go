@@ -21,16 +21,21 @@ import (
 func main() {
 	in := flag.String("i", "", "input wasm file (required)")
 	out := flag.String("o", "", "output wasm file (required)")
+	config := flag.String("config", "pglite", "module config: pglite|initdb")
 	flag.Parse()
 	if *in == "" || *out == "" {
 		flag.Usage()
 		os.Exit(2)
 	}
+	cfg := wasmpass.DefaultConfig()
+	if *config == "initdb" {
+		cfg = wasmpass.DefaultInitdbConfig()
+	}
 	raw, err := os.ReadFile(*in)
 	if err != nil {
 		fatal(err)
 	}
-	res, st, err := wasmpass.Transform(raw, wasmpass.DefaultConfig())
+	res, st, err := wasmpass.Transform(raw, cfg)
 	if err != nil {
 		fatal(err)
 	}

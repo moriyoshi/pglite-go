@@ -106,23 +106,34 @@ AOT-specific; everything else is shared. Cooperative longjmp maps to
 `CallExportRaw` reading (and clearing) `__THREW__` after the top-level call — no
 Go panic/recover.
 
-## Keeping the distributed codebase thin
+## Keeping the distributed codebase thin: the companion module
 
-The transpiled Go is ~14M LOC / ~200 MB — a build artifact, not source:
+The transpiled Go is ~14M LOC / ~200 MB — far too much to carry in this module. It
+lives in a **separate companion module, `github.com/moriyoshi/pglite-go-aot`**, so
+this core module stays thin (the default wasmtime/wazero backends need no generated
+Go at all). AOT is enabled with a `database/sql`-style **driver blank-import**:
 
-1. **Do not commit it** — generate locally (`go generate -tags aot`), exactly as
-   the `.wasm` assets are fetched not committed. The default backends need no
-   generated Go at all. AOT is an opt-in local build (not `go get`-able, since Go
-   does not run generate on install).
-2. **Companion module** (`pglite-go-aot`) if a `go get`-able prebuilt AOT is
-   wanted — versioned per PGlite release, like `goccy/llamawasm2go`.
-3. **Shrink the generated code**: keep `-pure` (the asm backend doubles output);
-   keep tight DCE roots (the 16 entry exports); and have `internal/wasmpass` share
-   one unwind landing per function instead of per-site (attacks the +29%
-   instrumentation LOC).
-4. The 10 MB `pglite.wasm` is the single source of truth for all three backends —
-   runtime backends load it, AOT transpiles it — so the shipped source stays thin
-   regardless of which backends are enabled.
+```go
+import (
+    "github.com/moriyoshi/pglite-go"
+    _ "github.com/moriyoshi/pglite-go-aot" // registers the AOT backend via init()
+)
+// build with -tags aot
+```
+
+The companion imports this module's `emscripten`/`vfs` packages and calls
+`pglite.RegisterAOT(pgwasm.NewAOT, initdbwasm.NewAOT)` from an `init()`. This module
+never imports the companion — so there is **no module cycle**, and `-tags aot`
+compiles here with no generated code present (the constructors are nil until a
+companion registers them; `newRuntimeFrom*` returns a clear error otherwise). The
+companion is regenerated and re-tagged per PGlite release (the `internal/wasmpass`
++ `internal/genaot` tools live here).
+
+Other levers, if the companion itself needs to be smaller: keep `-pure` (the asm
+backend doubles output); keep tight DCE roots; and have `internal/wasmpass` share
+one unwind landing per function instead of per-site (attacks the +29% LOC). The
+10 MB `pglite.wasm` remains the single source of truth for all three backends —
+runtime backends load it, AOT transpiles it.
 
 ## Generated glue (`internal/genaot`)
 
@@ -220,10 +231,39 @@ Two fixes were needed to get there:
   backends (this is a genuine termination, distinct from the panic-free cooperative
   longjmp).
 
+## Cold init (creating a cluster)
+
+initdb is transpiled too, so the AOT backend can create a cluster from scratch —
+not just warm-load one. `go generate -tags aot` also runs:
+
+```sh
+go run ./cmd/wasmpass -config initdb -i wasm/initdb.wasm -o wasm/initdb.standalone.wasm
+go run github.com/goccy/wasm2go/cmd/wasm2go@latest -i wasm/initdb.standalone.wasm \
+    -import github.com/moriyoshi/pglite-go/internal/initdbwasm -pkg initdbwasm -pure \
+    -o internal/initdbwasm/initdbwasm.go
+go run ./internal/genaot -dir internal/initdbwasm -pkg initdbwasm -kind initdb -sp 0
+```
+
+initdb is small, so wasm2go emits it **single-file** (methods on `*Module`,
+unexported fields, no `base` subpackage) rather than the multi-package split
+pglite gets — `genaot` auto-detects and handles both. Two initdb-specific
+constants: `__stack_pointer` is import global 0 (pglite: 1), and `__THREW__` is at
+a different address (derive it from `setThrew`'s `global.get` per module — the
+global *index* differs between modules). The cold path also needs the module's
+allocator/FILE exports kept (`malloc`, `emscripten_builtin_memalign`, `fopen`,
+`fclose`, `fflush`, `_emscripten_stack_alloc`) because the shared `_mmap_js` and
+initdb-callback handlers call back into them.
+
+**Verified:** `go test -tags aot -run TestAOTColdInit` opens against an *empty*
+persist dir, so Open runs initdb — which spawns `postgres --boot` in fresh AOT
+pgwasm instances over the shared VFS, captures ~1 MB of bootstrap SQL, and writes
+a valid cluster (`pg_control present=true`) — then runs `SELECT 42` -> `42`. Fully
+self-contained pure-Go PostgreSQL: no pre-existing cluster, no CGo, no wasm engine.
+(The `--single` post-bootstrap phase FATALs on the PG18 ICU root-collator issue,
+a pre-existing PGlite quirk unrelated to AOT; the essential catalog still lands.)
+
 ## Status / open items
 
-- End-to-end runtime proof at scale: wire the host `env`+WASI interface to the
-  generated package and drive pglite-go's wire protocol against a wasm2go build.
 - Productionize: share one unwind landing per function (shave the +29% LOC).
 - Alternative (not chosen — no-panic constraint): confined `panic`/`recover` in
   the ~56 host `invoke_*` trampolines only (~2 lines, zero wasm instrumentation).

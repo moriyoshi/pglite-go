@@ -4,6 +4,7 @@ package emscripten
 
 import (
 	"context"
+	"io"
 	"os"
 
 	"github.com/moriyoshi/pglite-go/vfs"
@@ -19,7 +20,14 @@ type AOTDispatch struct {
 	syscalls map[string]api.GoModuleFunc
 	wasi     map[string]api.GoModuleFunc
 	cache    map[string]api.GoModuleFunc
+	w        *wasiImpl
 }
+
+// SetStdout/SetStderr/SetStdoutCapture retarget the VFS-backed WASI streams.
+// SetStdoutCapture is what makes initdb's popen("w") bootstrap-SQL capture work.
+func (d *AOTDispatch) SetStdout(w io.Writer)        { d.w.stdout = w }
+func (d *AOTDispatch) SetStderr(w io.Writer)        { d.w.stderr = w }
+func (d *AOTDispatch) SetStdoutCapture(buf *[]byte) { d.w.StdoutOverride = buf }
 
 // NewAOTDispatch builds the handler maps over the given VFS/stdin/capture. Note:
 // this is the emscripten (VFS-backed) WASI, replacing wasm2go's host-backed
@@ -36,6 +44,7 @@ func NewAOTDispatch(fs *vfs.FS, stdin []byte, capture *[]byte) *AOTDispatch {
 		syscalls: NewSyscallHandler(fs).Register(),
 		wasi:     w.aotFuncs(),
 		cache:    map[string]api.GoModuleFunc{},
+		w:        w,
 	}
 }
 
