@@ -125,6 +125,17 @@ func (w *wireConn) exec(msg []byte) ([]byte, error) {
 			}
 		}
 		_, longjmp, err := w.rt.CallExportRaw("PostgresMainLoopOnce")
+		if err != nil && isQueryErrorExit(err) {
+			// A statement raised an ERROR: PGlite unwinds the loop by exiting
+			// with status 100 (POSTGRES_MAIN_LONGJMP) instead of longjmping in
+			// place, so the trap surfaces here as an error rather than via the
+			// longjmp flag. Recover it exactly like a longjmp — the buffered
+			// ErrorResponse + ReadyForQuery are flushed below and decoded into a
+			// Go error, leaving the session alive for the next query. (Mirrors
+			// PGlite's own driver, which catches the throw and runs
+			// PostgresMainLongJmp when the exit status is 100.)
+			longjmp, err = true, nil
+		}
 		if longjmp {
 			if _, err := w.rt.CallExport("PostgresMainLongJmp"); err != nil {
 				return nil, err
@@ -138,6 +149,18 @@ func (w *wireConn) exec(msg []byte) ([]byte, error) {
 	w.rt.CallExport("PostgresSendReadyForQueryIfNecessary")
 	w.rt.CallExport("pgl_pq_flush")
 	return w.in, nil
+}
+
+// isQueryErrorExit reports whether err is PGlite's query-error boundary. When a
+// statement raises an ERROR, PGlite's wire backend unwinds PostgresMainLoopOnce
+// by calling exit(100) — POSTGRES_MAIN_LONGJMP — rather than reporting an
+// in-place longjmp. The code is matched exactly so genuine terminations (a real
+// FATAL/shutdown with a different exit code) stay fatal. (Newer PGlite exposes
+// pgl_setPGliteExitStatus to read this code; our wasm build does not export it,
+// so the trap's exit code is read from the error text instead.)
+func isQueryErrorExit(err error) bool {
+	return err != nil &&
+		(strings.Contains(err.Error(), "exit(100)") || strings.Contains(err.Error(), "proc_exit(100)"))
 }
 
 // simpleQuery runs sql via the simple query protocol ('Q').
