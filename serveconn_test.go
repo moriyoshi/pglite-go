@@ -10,7 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// sslRequestMessage builds an SSLRequest packet (the pgx/libpq sslmode=prefer
+// opener): a 4-byte length followed by the magic request code 80877103.
+func sslRequestMessage() []byte {
+	return binary.BigEndian.AppendUint32(binary.BigEndian.AppendUint32(nil, 8), 80877103)
+}
 
 // openTestDB opens an ephemeral in-memory cluster from the repo's wasm assets.
 func openTestDB(t *testing.T) *DB {
@@ -55,6 +62,101 @@ func drainToReady(t *testing.T, br *bufio.Reader) map[byte][]byte {
 		if typ == 'Z' {
 			return msgs
 		}
+	}
+}
+
+// TestServeConnConcurrentSSLNegotiation reproduces issue #7: while one client
+// holds the single shared backend open, a second client that opens with an
+// SSLRequest (pgx/libpq default sslmode=prefer) must still receive its 'N'
+// decline and complete the StartupMessage exchange, rather than blocking on the
+// backend lock before a byte of its stream is read.
+func TestServeConnConcurrentSSLNegotiation(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer ln.Close()
+
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go db.ServeConn(c)
+		}
+	}()
+
+	// Client A: a warm pooled connection that finishes startup and stays open,
+	// holding the backend lock for the duration.
+	connA, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial A: %v", err)
+	}
+	defer connA.Close()
+	brA := bufio.NewReader(connA)
+	if _, err := connA.Write(startupMessage("postgres", db.database)); err != nil {
+		t.Fatalf("write startup A: %v", err)
+	}
+	drainToReady(t, brA) // A is now ready and keeps holding the backend
+
+	// Client B: opens with an SSLRequest, then completes startup. Before the fix
+	// this blocked forever reading the S/N reply because ServeConn took the
+	// backend lock before reading B's socket.
+	connB, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial B: %v", err)
+	}
+	defer connB.Close()
+	brB := bufio.NewReader(connB)
+
+	done := make(chan error, 1)
+	go func() {
+		if _, err := connB.Write(sslRequestMessage()); err != nil {
+			done <- err
+			return
+		}
+		// The single-byte SSL decline must arrive without A disconnecting.
+		b, err := brB.ReadByte()
+		if err != nil {
+			done <- err
+			return
+		}
+		if b != 'N' {
+			done <- io.ErrUnexpectedEOF
+			return
+		}
+		done <- nil
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("B SSL negotiation: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("client B hung during SSL negotiation while A held the backend (issue #7)")
+	}
+
+	// B can now send its StartupMessage; its startup reply is deferred until A
+	// releases the backend. Close A and confirm B proceeds to ReadyForQuery.
+	if _, err := connB.Write(startupMessage("postgres", db.database)); err != nil {
+		t.Fatalf("write startup B: %v", err)
+	}
+	connA.Close()
+
+	bReady := make(chan struct{}, 1)
+	go func() {
+		drainToReady(t, brB)
+		bReady <- struct{}{}
+	}()
+	select {
+	case <-bReady:
+	case <-time.After(10 * time.Second):
+		t.Fatal("client B did not reach ReadyForQuery after A disconnected")
 	}
 }
 
