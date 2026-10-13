@@ -28,25 +28,44 @@ import (
 // does not open a new one per client: it answers the startup handshake itself
 // (AuthenticationOk, a synthetic set of ParameterStatus values, BackendKeyData,
 // ReadyForQuery — authentication is always trust) and then shuttles protocol
-// messages to and from that single shared session. Consequently ServeConn holds
-// the DB's backend exclusively for the entire lifetime of conn: other ServeConn
-// calls and Query/Exec/QueryParams block until the served client disconnects.
+// messages to and from that single shared session. The SSL/GSS negotiation and
+// StartupMessage are handled before the backend lock is taken, so a concurrently
+// connecting client can finish its handshake; from the startup reply onward
+// ServeConn holds the DB's backend exclusively for the rest of conn's lifetime,
+// so other ServeConn calls and Query/Exec/QueryParams block there until the
+// served client disconnects.
 //
 // A client Terminate ('X') ends only that client; it is never forwarded to the
 // shared backend. ServeConn closes conn before returning.
 func (db *DB) ServeConn(conn net.Conn) error {
 	defer conn.Close()
 
+	br := bufio.NewReader(conn)
+
+	// Startup phase runs BEFORE the backend lock: negotiate SSL/GSS (declined)
+	// and consume the StartupMessage. This must not block on db.mu — a client
+	// that opens with an SSLRequest (pgx/libpq default sslmode=prefer) is blocked
+	// reading the one-byte S/N reply, so if we waited on the lock first a second
+	// client would hang mid-negotiation until the first disconnects.
+	if err := db.serveStartup(conn, br); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil
+		}
+		return err
+	}
+
+	// Only the query relay needs exclusive access to the single shared backend.
+	// Acquire it now that the client has finished its handshake; a second client
+	// simply waits here instead of deadlocking during SSL negotiation.
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if db.wire == nil {
 		return errors.New("pglite: DB is closed")
 	}
 
-	br := bufio.NewReader(conn)
-
-	// Startup phase: negotiate SSL/GSS (declined), then answer the StartupMessage.
-	if err := db.serveStartup(conn, br); err != nil {
+	// Answer the StartupMessage (AuthenticationOk, ParameterStatus, BackendKeyData,
+	// ReadyForQuery) now that we hold the backend — startupParams queries it.
+	if err := db.sendStartupResponse(conn); err != nil {
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil
 		}
@@ -85,9 +104,11 @@ func (db *DB) ServeConn(conn net.Conn) error {
 	}
 }
 
-// serveStartup consumes SSL/GSS negotiation and the StartupMessage, then emits
-// the backend's startup reply. SSL and GSS are declined; a CancelRequest is a
-// no-op (the single-session backend has nothing to cancel).
+// serveStartup consumes SSL/GSS negotiation and the StartupMessage. SSL and GSS
+// are declined; a CancelRequest is a no-op (the single-session backend has
+// nothing to cancel). It returns nil once a protocol 3.0 StartupMessage has been
+// read; the caller then takes the backend lock and emits the startup reply. This
+// touches only conn (never the backend), so it is safe to run without db.mu.
 func (db *DB) serveStartup(conn net.Conn, br *bufio.Reader) error {
 	for {
 		var lenbuf [4]byte
@@ -110,7 +131,7 @@ func (db *DB) serveStartup(conn net.Conn, br *bufio.Reader) error {
 		case 80877102: // CancelRequest
 			return io.EOF // nothing to cancel; just drop the connection
 		case 196608: // protocol 3.0 StartupMessage
-			return db.sendStartupResponse(conn)
+			return nil // handshake read; caller locks the backend and replies
 		default:
 			conn.Write(frame('E', errorBody("FATAL", "0A000",
 				fmt.Sprintf("unsupported protocol/request code 0x%08x", code))))
